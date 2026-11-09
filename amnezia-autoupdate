@@ -1,0 +1,1901 @@
+#!/usr/bin/env bash
+#
+# amnezia-autoupdate: ежедневное обновление ОС и серверных контейнеров Amnezia VPN.
+#
+# Как это работает
+#   * Контейнеры собираются по официальным серверным скриптам приложения Amnezia
+#     (github.com/amnezia-vpn/amnezia-client, папка client/server_scripts) из
+#     последнего релиза, теми же Dockerfile и run_container.sh, что использует приложение.
+#   * Перед заменой контейнера его /opt/amnezia (ключи сервера, клиенты, clientsTable,
+#     start.sh) копируется и переносится в новый контейнер, поэтому выданные
+#     пользователям конфиги продолжают работать.
+#   * Новый контейнер проверяется: интерфейс поднят, порт и ключ сервера прежние,
+#     число клиентов совпадает. Если проверка не прошла, возвращается старый контейнер.
+#
+# Запуск: amnezia-autoupdate help
+
+set -uo pipefail
+umask 077
+export LC_ALL=C
+
+VERSION="1.0.0"
+PROG="amnezia-autoupdate"
+
+CONF_FILE="${AAU_CONF:-/etc/amnezia-autoupdate.conf}"
+STATE_DIR="${AAU_STATE_DIR:-/var/lib/amnezia-autoupdate}"
+BACKUP_ROOT="${AAU_BACKUP_DIR:-/var/backups/amnezia-autoupdate}"
+LOG_FILE="${AAU_LOG_FILE:-/var/log/amnezia-autoupdate.log}"
+LOCK_FILE="${AAU_LOCK_FILE:-/run/amnezia-autoupdate.lock}"
+
+# ---------------------------------------------------------------- настройки по умолчанию
+# Любую из них можно переопределить в /etc/amnezia-autoupdate.conf
+UPSTREAM_REPO="amnezia-vpn/amnezia-client"
+UPSTREAM_REF="latest"        # latest = последний релиз, или тег, например 5.1.0.6
+UPSTREAM_LOCAL_DIR=""        # локальная копия client/server_scripts (для тестов и без интернета)
+OS_UPDATE="yes"              # обновлять пакеты ОС
+CONTAINERS_UPDATE="yes"      # обновлять контейнеры Amnezia
+HOST_SETUP="yes"             # заново применять setup_host_firewall.sh (после перезагрузки он теряется)
+REBOOT="if-needed"           # if-needed | never | always
+FORCE_REBUILD_DAYS="0"       # пересобирать контейнер раз в N дней, даже если ничего не изменилось (0 = нет)
+KEEP_BACKUPS="10"            # сколько последних резервных копий /opt/amnezia хранить для каждого контейнера
+MIN_FREE_MB="1500"           # минимум свободного места для сборки образа
+HEALTH_TIMEOUT="60"          # сколько секунд ждать, пока новый контейнер заработает
+NOTIFY="changes"             # changes | errors | always | never (уведомления в Telegram)
+TELEGRAM_BOT_TOKEN=""
+TELEGRAM_CHAT_ID=""
+SERVER_NAME=""               # имя сервера в уведомлениях (по умолчанию hostname)
+SELF_UPDATE_URL="https://raw.githubusercontent.com/iF-22/amnezia-autoupdate/main/amnezia-autoupdate"   # откуда брать новую версию этого скрипта
+
+# ---------------------------------------------------------------- контейнеры
+# Имя контейнера в приложении -> папка серверных скриптов в amnezia-client
+declare -A FOLDER_OF=(
+  [amnezia-awg2]=awg
+  [amnezia-awg]=awg_legacy
+  [amnezia-wireguard]=wireguard
+  [amnezia-xray]=xray
+  [amnezia-dns]=dns
+)
+UPDATE_ORDER=(amnezia-awg2 amnezia-awg amnezia-wireguard amnezia-xray amnezia-dns)
+SHARED_SCRIPTS=(install_docker.sh prepare_host.sh build_container.sh setup_host_firewall.sh update_server_packages.sh)
+FOLDER_SCRIPTS=(Dockerfile run_container.sh configure_container.sh start.sh template.conf)
+
+# Значения по умолчанию из приложения (client/core/utils/constants/protocolConstants.h)
+DEFAULT_SUBNET_IP="10.8.1.0"
+DEFAULT_SUBNET_CIDR="24"
+DEFAULT_AWG_PORT="55424"
+DEFAULT_WG_PORT="51820"
+DEFAULT_XRAY_PORT="443"
+DEFAULT_XRAY_SITE="www.googletagmanager.com"
+DNS_NET="amnezia-dns-net"
+
+# ---------------------------------------------------------------- состояние запуска
+CHANGES=()
+WARNINGS=()
+ERRORS=()
+FORCE=0
+DRY_RUN=0
+NO_REBOOT=0
+ONLY=""
+UP=""
+UP_TAG=""
+REASON=""
+VARS=()
+EXPECT_PORT=""
+EXPECT_PUBKEY=""
+EXPECT_PEERS=""
+WORK=""
+SHIM_DIR=""
+CUR_BACKUP=""
+RUN_STAMP=""                 # одна папка резервных копий на весь запуск
+RUN_SCRIPT=""
+START_NEW=""
+DEPLOY_OWNER=""
+
+# ---------------------------------------------------------------- вывод
+ts()     { date '+%F %T'; }
+log()    { printf '%s %s\n' "$(ts)" "$*"; }
+warn()   { printf '%s ВНИМАНИЕ: %s\n' "$(ts)" "$*"; WARNINGS+=("$*"); }
+fail()   { printf '%s ОШИБКА: %s\n' "$(ts)" "$*"; ERRORS+=("$*"); }
+change() { printf '%s %s\n' "$(ts)" "$*"; CHANGES+=("$*"); }
+die()    { printf '%s ОШИБКА: %s\n' "$(ts)" "$*" >&2; exit 1; }
+
+server_label() {
+  if [[ -n $SERVER_NAME ]]; then printf '%s' "$SERVER_NAME"; else hostname -f 2>/dev/null || hostname; fi
+}
+
+notify() {
+  [[ -n $TELEGRAM_BOT_TOKEN && -n $TELEGRAM_CHAT_ID ]] || return 0
+  curl -fsS --max-time 20 -o /dev/null \
+    --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+    --data-urlencode "text=$1" \
+    "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+    || printf '%s ВНИМАНИЕ: не удалось отправить уведомление в Telegram\n' "$(ts)"
+}
+
+# ---------------------------------------------------------------- общее
+load_config() {
+  if [[ -f $CONF_FILE ]]; then
+    local owner
+    owner=$(stat -c %u "$CONF_FILE" 2>/dev/null || echo 0)
+    [[ $owner == 0 ]] || die "$CONF_FILE должен принадлежать root"
+    # shellcheck source=/dev/null
+    . "$CONF_FILE"
+  fi
+  [[ $KEEP_BACKUPS =~ ^[0-9]+$ ]] || KEEP_BACKUPS=10
+  [[ $MIN_FREE_MB =~ ^[0-9]+$ ]] || MIN_FREE_MB=1500
+  [[ $HEALTH_TIMEOUT =~ ^[0-9]+$ ]] || HEALTH_TIMEOUT=60
+  [[ $FORCE_REBUILD_DAYS =~ ^[0-9]+$ ]] || FORCE_REBUILD_DAYS=0
+}
+
+need_root() { [[ $EUID -eq 0 ]] || die "нужны права root, запусти через sudo"; }
+
+init_work() {
+  WORK=$(mktemp -d /tmp/amnezia-autoupdate.XXXXXX) || die "не могу создать временную папку"
+  trap cleanup_work EXIT
+  # Скрипты приложения вызывают sudo. Мы уже root; если sudo нет, подставляем заглушку.
+  if ! command -v sudo >/dev/null 2>&1; then
+    SHIM_DIR="$WORK/shim"
+    mkdir -p "$SHIM_DIR"
+    cat > "$SHIM_DIR/sudo" <<'EOF'
+#!/bin/sh
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -u|-g|-p|-C) shift 2 ;;
+    --) shift; break ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+[ $# -eq 0 ] && exit 0
+exec "$@"
+EOF
+    chmod 755 "$SHIM_DIR/sudo"
+    export PATH="$SHIM_DIR:$PATH"
+  fi
+}
+
+cleanup_work() { [[ -n $WORK && -d $WORK ]] && rm -rf "$WORK"; }
+
+acquire_lock() {
+  exec 9>"$LOCK_FILE" || die "не могу открыть $LOCK_FILE"
+  if ! flock -n 9; then
+    log "уже идёт другой запуск $PROG, жду до 30 минут"
+    flock -w 1800 9 || die "другой запуск $PROG не завершился за 30 минут"
+  fi
+}
+
+start_logging() {
+  mkdir -p "$(dirname "$LOG_FILE")"
+  exec > >(tee -a "$LOG_FILE") 2>&1
+}
+
+have_docker() { command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; }
+
+valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
+valid_ipv4() { [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+valid_tag()  { [[ $1 =~ ^[A-Za-z0-9._-]+$ ]]; }
+
+primary_ip() {
+  ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit }}'
+}
+
+free_mb() { df -Pm "$1" 2>/dev/null | awk 'NR == 2 { print $4 }'; }
+
+docker_root() { docker info -f '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker; }
+
+# Ежедневная уборка: висячие образы, кэш сборки Docker, кэш пакетов
+cleanup_light() {
+  if have_docker; then
+    docker image prune -f >/dev/null 2>&1
+    docker builder prune -af >/dev/null 2>&1
+  fi
+  if command -v apt-get >/dev/null 2>&1; then apt-get clean >/dev/null 2>&1; fi
+  if command -v dnf >/dev/null 2>&1; then dnf clean packages >/dev/null 2>&1; fi
+}
+
+# Когда места мало: то же плюс старые журналы
+cleanup_disk() {
+  cleanup_light
+  if command -v journalctl >/dev/null 2>&1; then journalctl --vacuum-size=100M >/dev/null 2>&1; fi
+}
+
+ensure_free_space() {
+  local path=$1 free
+  free=$(free_mb "$path")
+  [[ -z $free ]] && return 0
+  (( free >= MIN_FREE_MB )) && return 0
+  log "свободно ${free} МБ (нужно ${MIN_FREE_MB}), чищу старые образы, кэш сборки и apt"
+  cleanup_disk
+  free=$(free_mb "$path")
+  (( free >= MIN_FREE_MB ))
+}
+
+# ---------------------------------------------------------------- скрипты приложения Amnezia
+resolve_upstream_tag() {
+  local url tag
+  if [[ -n $UPSTREAM_LOCAL_DIR ]]; then printf 'local'; return 0; fi
+  if [[ $UPSTREAM_REF != latest ]]; then
+    valid_tag "$UPSTREAM_REF" || return 1
+    printf '%s' "$UPSTREAM_REF"
+    return 0
+  fi
+  # Редирект страницы последнего релиза не тратит лимит GitHub API
+  url=$(curl -fsSL --max-time 30 -o /dev/null -w '%{url_effective}' \
+        "https://github.com/${UPSTREAM_REPO}/releases/latest" 2>/dev/null) || url=""
+  tag=${url##*/releases/tag/}
+  if [[ -n $url && $tag != "$url" ]] && valid_tag "$tag"; then printf '%s' "$tag"; return 0; fi
+  tag=$(curl -fsSL --max-time 30 "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest" 2>/dev/null \
+        | jq -r '.tag_name // empty' 2>/dev/null) || tag=""
+  if [[ -n $tag ]] && valid_tag "$tag"; then printf '%s' "$tag"; return 0; fi
+  return 1
+}
+
+# fetch_file TAG RELPATH DEST -> 0 скачан, 2 нет такого файла, 1 ошибка сети
+fetch_file() {
+  local tag=$1 rel=$2 dst=$3 code
+  if [[ -n $UPSTREAM_LOCAL_DIR ]]; then
+    [[ -f $UPSTREAM_LOCAL_DIR/$rel ]] || return 2
+    cp "$UPSTREAM_LOCAL_DIR/$rel" "$dst" || return 1
+  else
+    code=$(curl -sS -L --max-time 60 --retry 3 --retry-delay 5 -o "$dst" -w '%{http_code}' \
+           "https://raw.githubusercontent.com/${UPSTREAM_REPO}/${tag}/client/server_scripts/${rel}" 2>/dev/null) || code=000
+    case $code in
+      200) ;;
+      404) rm -f "$dst"; return 2 ;;
+      *)   rm -f "$dst"; return 1 ;;
+    esac
+  fi
+  sed -i 's/\r$//' "$dst"   # приложение тоже убирает \r перед загрузкой на сервер
+  return 0
+}
+
+use_cached_upstream() {
+  local cur="$STATE_DIR/upstream/current"
+  if [[ -f $cur/.complete ]]; then
+    UP=$(readlink -f "$cur")
+    UP_TAG=$(cat "$cur/.tag")
+    warn "$1; использую сохранённые скрипты релиза $UP_TAG"
+    return 0
+  fi
+  fail "$1, а сохранённых скриптов нет"
+  return 1
+}
+
+# Скачивает серверные скрипты нужного релиза в $STATE_DIR/upstream/<тег> и выставляет UP, UP_TAG
+prepare_upstream() {
+  [[ -n $UP ]] && return 0
+  local tag dir tmp f folder rc
+  if ! tag=$(resolve_upstream_tag); then
+    use_cached_upstream "не удалось узнать последний релиз ${UPSTREAM_REPO}"
+    return $?
+  fi
+  dir="$STATE_DIR/upstream/$tag"
+  if [[ $tag != local && -f $dir/.complete ]]; then
+    UP=$dir; UP_TAG=$tag
+    ln -sfn "$dir" "$STATE_DIR/upstream/current"
+    return 0
+  fi
+  mkdir -p "$STATE_DIR/upstream"
+  tmp=$(mktemp -d "$STATE_DIR/upstream/.download.XXXXXX")
+  for f in "${SHARED_SCRIPTS[@]}"; do
+    fetch_file "$tag" "$f" "$tmp/$f"; rc=$?
+    if (( rc != 0 )); then
+      rm -rf "$tmp"
+      use_cached_upstream "не удалось скачать $f из релиза $tag"
+      return $?
+    fi
+  done
+  for folder in $(printf '%s\n' "${FOLDER_OF[@]}" | sort -u); do
+    mkdir -p "$tmp/$folder"
+    for f in "${FOLDER_SCRIPTS[@]}"; do
+      fetch_file "$tag" "$folder/$f" "$tmp/$folder/$f"; rc=$?
+      if (( rc == 1 )) || { (( rc == 2 )) && [[ $f == Dockerfile || $f == run_container.sh ]]; }; then
+        rm -rf "$tmp"
+        use_cached_upstream "не удалось скачать $folder/$f из релиза $tag"
+        return $?
+      fi
+    done
+  done
+  printf '%s\n' "$tag" > "$tmp/.tag"
+  touch "$tmp/.complete"
+  rm -rf "$dir"
+  mv "$tmp" "$dir"
+  ln -sfn "$dir" "$STATE_DIR/upstream/current"
+  UP=$dir; UP_TAG=$tag
+  # оставляем три последних релиза
+  find "$STATE_DIR/upstream" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%T@ %p\n' 2>/dev/null \
+    | sort -rn | tail -n +4 | cut -d' ' -f2- | while read -r old; do
+        [[ $old == "$dir" ]] || rm -rf "$old"
+      done
+  log "серверные скрипты Amnezia: релиз $UP_TAG"
+  return 0
+}
+
+# Подстановка переменных так же, как в приложении: простая замена $ИМЯ на значение.
+# Длинные имена заменяются первыми, чтобы $AWG_SUBNET_IP не задел $AWG_SUBNET_IP_X.
+render() {
+  local src=$1 dst=$2 content kv k v
+  content=$(<"$src")
+  while IFS= read -r kv; do
+    [[ -z $kv ]] && continue
+    k=${kv%%=*}
+    v=${kv#*=}
+    content=${content//"\$$k"/"$v"}
+  done < <(printf '%s\n' "${VARS[@]}" | awk -F= '{ print length($1) "\t" $0 }' | sort -rn | cut -f2-)
+  printf '%s\n' "$content" > "$dst"
+}
+
+# Переменные вида $ИМЯ, оставшиеся после подстановки: те, которым скрипт сам ничего
+# не присваивает (без строк-комментариев и обычных переменных окружения)
+leftover_vars() {
+  local f=$1 own
+  own=$(grep -oE '(^|[;&|({[:space:]])(export[[:space:]]+|local[[:space:]]+|readonly[[:space:]]+)?[A-Z][A-Z0-9_]{2,}=' "$f" \
+        | grep -oE '[A-Z][A-Z0-9_]{2,}=$' | tr -d '=' | sort -u)
+  own+=$'\n'"HOME"$'\n'"PATH"$'\n'"USER"$'\n'"PWD"$'\n'"RANDOM"$'\n'"HOSTNAME"$'\n'"UID"$'\n'"EUID"
+  grep -vE '^[[:space:]]*#' "$f" | grep -oE '\$[A-Z][A-Z0-9_]{2,}' | cut -c2- | sort -u \
+    | grep -vxF -f <(printf '%s\n' "$own" | grep .) | sed 's/^/$/' | tr '\n' ' ' | sed 's/ $//'
+}
+
+# Подставляет переменные и проверяет, что ничего не осталось. Иначе релиз изменился так,
+# что вслепую выполнять скрипт нельзя.
+render_checked() {   # render_checked SRC DST CONTAINER
+  local left
+  render "$1" "$2"
+  left=$(leftover_vars "$2")
+  [[ -z $left ]] && return 0
+  fail "$3: в $(basename "$1") из релиза $UP_TAG новые параметры ($left), нужна новая версия $PROG или установка через приложение"
+  return 1
+}
+
+# run_container.sh в приложении состоит только из команд docker. Если в новой версии
+# появилось что-то другое, не выполняем его вслепую.
+docker_only_script() {
+  local bad
+  bad=$(awk '{ if (sub(/\\[[:space:]]*$/, "")) { buf = buf $0 " "; next } print buf $0; buf = "" }
+             END { if (buf != "") print buf }' "$1" \
+        | sed -E 's/^[[:space:]]+//' | grep -vE '^(#|$)' \
+        | grep -vE '^(sudo[[:space:]]+(-[A-Za-z]+[[:space:]]+)*)?docker[[:space:]]')
+  [[ -z $bad ]]
+}
+
+# Базовые образы из Dockerfile (FROM), без ссылок на стадии сборки
+dockerfile_bases() {
+  awk 'toupper($1) == "FROM" {
+         img = ""
+         for (i = 2; i <= NF; i++) { if ($i ~ /^--/) continue; img = $i; break }
+         if (img != "" && !(img in stage) && img !~ /^\$/) print img
+         for (i = 2; i < NF; i++) if (toupper($i) == "AS") stage[$(i + 1)] = 1
+       }' "$1" | sort -u
+}
+
+# ---------------------------------------------------------------- docker
+c_exists()  { docker container inspect "$1" >/dev/null 2>&1; }
+c_running() { [[ $(docker container inspect -f '{{.State.Running}}' "$1" 2>/dev/null) == true ]]; }
+c_image()   { docker container inspect -f '{{.Image}}' "$1" 2>/dev/null; }
+c_restart_policy() { docker container inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$1" 2>/dev/null; }
+img_layers() { docker image inspect -f '{{range .RootFS.Layers}}{{println .}}{{end}}' "$1" 2>/dev/null; }
+
+list_amnezia_containers() {
+  docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^amnezia-' | grep -vE -- '-aau-prev$' | sort
+}
+
+# Образ контейнера собран поверх текущей версии базового образа?
+built_on_base() {
+  local img=$1 base=$2 il bl
+  bl=$(img_layers "$base") || return 1
+  il=$(img_layers "$img") || return 1
+  [[ -n $bl && $il == "$bl"* ]]
+}
+
+# Опубликованные порты контейнера: строки "55424/udp 55424"
+published_ports() {
+  docker container inspect -f '{{range $p, $b := .HostConfig.PortBindings}}{{$p}}{{range $b}} {{.HostPort}}{{end}}{{println}}{{end}}' "$1" 2>/dev/null \
+    | grep -v '^$'
+}
+
+ensure_dns_network() {
+  docker network inspect "$DNS_NET" >/dev/null 2>&1 && return 0
+  # та же команда, что в prepare_host.sh приложения
+  docker network create --driver bridge --subnet=172.29.172.0/24 \
+    --opt com.docker.network.bridge.name=amn0 "$DNS_NET" >/dev/null
+}
+
+# ---------------------------------------------------------------- настройки протоколов
+# У AmneziaDNS нет своего состояния (ключей и пользователей), его достаточно пересобрать
+has_state() { [[ $1 != amnezia-dns ]]; }
+
+conf_get() {   # conf_get FILE KEY -> значение строки "KEY = VALUE"
+  awk -v k="$2" '{
+      line = $0; sub(/\r$/, "", line)
+      split(line, a, "="); key = a[1]; gsub(/^[ \t]+|[ \t]+$/, "", key)
+      if (key == k) { sub(/^[^=]*=[ \t]*/, "", line); sub(/[ \t]+$/, "", line); print line; exit }
+    }' "$1" 2>/dev/null
+}
+
+base_vars() {
+  local c=$1 ip
+  ip=$(primary_ip)
+  VARS=(
+    "CONTAINER_NAME=$c"
+    "DOCKERFILE_FOLDER=/opt/amnezia/$c"
+    "REMOTE_HOST=${ip:-127.0.0.1}"
+    "SERVER_IP_ADDRESS=${ip:-127.0.0.1}"
+    "PRIMARY_SERVER_DNS=8.8.8.8"
+    "SECONDARY_SERVER_DNS=8.8.4.4"
+  )
+}
+
+# Файлы конфигурации внутри /opt/amnezia контейнера
+wg_conf_rel() {
+  case $1 in
+    amnezia-awg2) echo awg/awg0.conf ;;
+    amnezia-awg) echo awg/wg0.conf ;;
+    amnezia-wireguard) echo wireguard/wg0.conf ;;
+  esac
+}
+wg_pubkey_rel() {
+  case $1 in
+    amnezia-awg2|amnezia-awg) echo awg/wireguard_server_public_key.key ;;
+    amnezia-wireguard) echo wireguard/wireguard_server_public_key.key ;;
+  esac
+}
+wg_tool() {
+  case $1 in
+    amnezia-awg2) echo "awg awg0" ;;
+    amnezia-awg|amnezia-wireguard) echo "wg wg0" ;;
+  esac
+}
+
+# Достаёт порт и подсеть из сохранённой копии /opt/amnezia контейнера -> VARS
+extract_vars() {
+  local c=$1 dir=$2 conf port addr ip cidr
+  base_vars "$c"
+  EXPECT_PORT=""
+  case $c in
+    amnezia-awg2|amnezia-awg|amnezia-wireguard)
+      conf="$dir/$(wg_conf_rel "$c")"
+      [[ -f $conf ]] || { fail "$c: в контейнере нет $(wg_conf_rel "$c")"; return 1; }
+      port=$(conf_get "$conf" ListenPort)
+      addr=$(conf_get "$conf" Address)
+      ip=${addr%%/*}
+      cidr=${addr#*/}
+      [[ $cidr == "$addr" ]] && cidr=$DEFAULT_SUBNET_CIDR
+      if ! valid_port "$port" || ! valid_ipv4 "$ip" || ! [[ $cidr =~ ^[0-9]{1,2}$ ]]; then
+        fail "$c: не смог прочитать ListenPort/Address из $(wg_conf_rel "$c")"
+        return 1
+      fi
+      if [[ $c == amnezia-wireguard ]]; then
+        VARS+=("WIREGUARD_SERVER_PORT=$port" "WIREGUARD_SUBNET_IP=$ip" "WIREGUARD_SUBNET_CIDR=$cidr")
+      else
+        VARS+=("AWG_SERVER_PORT=$port" "AWG_SUBNET_IP=$ip" "WIREGUARD_SUBNET_CIDR=$cidr")
+      fi
+      EXPECT_PORT=$port
+      ;;
+    amnezia-xray)
+      conf="$dir/xray/server.json"
+      [[ -f $conf ]] || { fail "$c: в контейнере нет xray/server.json"; return 1; }
+      port=$(jq -r '.inbounds[0].port // empty' "$conf" 2>/dev/null)
+      valid_port "$port" || { fail "$c: не смог прочитать порт из server.json"; return 1; }
+      VARS+=("XRAY_SERVER_PORT=$port")
+      EXPECT_PORT=$port
+      ;;
+    amnezia-dns) ;;
+  esac
+  return 0
+}
+
+# Порт в конфиге должен совпадать с опубликованным портом контейнера (так ставит приложение)
+check_published_port() {
+  local c=$1
+  [[ -z $EXPECT_PORT ]] && return 0
+  if ! published_ports "$c" | grep -qE "^${EXPECT_PORT}/(udp|tcp) ${EXPECT_PORT}( |$)"; then
+    fail "$c: порт $EXPECT_PORT из конфига не совпадает с портами контейнера ($(published_ports "$c" | tr '\n' ';')), не трогаю"
+    return 1
+  fi
+}
+
+# Что должно получиться после обновления: тот же ключ сервера и не меньше клиентов.
+# Берём из работающего старого контейнера, а если его интерфейс не поднят, из конфига.
+set_expectations() {
+  local c=$1 dir=$2 tool ifc pub n
+  EXPECT_PUBKEY=""
+  EXPECT_PEERS=""
+  case $c in
+    amnezia-awg2|amnezia-awg|amnezia-wireguard)
+      read -r tool ifc <<< "$(wg_tool "$c")"
+      pub=$(docker exec "$c" "$tool" show "$ifc" public-key 2>/dev/null) || pub=""
+      if [[ -n $pub ]]; then
+        n=$(docker exec "$c" "$tool" show "$ifc" peers 2>/dev/null | grep -c .)
+      else
+        pub=$(tr -d '[:space:]' < "$dir/$(wg_pubkey_rel "$c")" 2>/dev/null)
+        n=$(grep -cE '^[[:space:]]*\[Peer\]' "$dir/$(wg_conf_rel "$c")" 2>/dev/null)
+      fi
+      EXPECT_PUBKEY=$pub
+      EXPECT_PEERS=${n:-0}
+      ;;
+  esac
+}
+
+# Интерфейс слушает нужный порт? amneziawg-go (userspace) на сервере без IPv6 показывает
+# listen-port 0, хотя порт открыт, поэтому тогда смотрим на сокет в контейнере.
+wg_port_ok() {
+  local c=$1 tool=$2 ifc=$3 v
+  v=$(docker exec "$c" "$tool" show "$ifc" listen-port 2>/dev/null) || return 1
+  [[ $v == "$EXPECT_PORT" ]] && return 0
+  [[ $v == 0 ]] || return 1
+  docker exec "$c" sh -c "netstat -lnu 2>/dev/null | grep -q ':${EXPECT_PORT} '"
+}
+
+probe() {
+  local c=$1 tool ifc v n
+  case $c in
+    amnezia-awg2|amnezia-awg|amnezia-wireguard)
+      read -r tool ifc <<< "$(wg_tool "$c")"
+      wg_port_ok "$c" "$tool" "$ifc" || return 1
+      if [[ -n $EXPECT_PUBKEY ]]; then
+        v=$(docker exec "$c" "$tool" show "$ifc" public-key 2>/dev/null) || return 1
+        [[ $v == "$EXPECT_PUBKEY" ]] || return 1
+      fi
+      if [[ -n $EXPECT_PEERS ]]; then
+        n=$(docker exec "$c" "$tool" show "$ifc" peers 2>/dev/null | grep -c .)
+        (( n >= EXPECT_PEERS )) || return 1
+      fi
+      ;;
+    amnezia-xray)
+      docker exec "$c" sh -c "pidof xray >/dev/null 2>&1 && netstat -ltn 2>/dev/null | grep -q ':${EXPECT_PORT} '" || return 1
+      ;;
+    *)
+      [[ $(docker container inspect -f '{{.State.Restarting}}' "$c" 2>/dev/null) == false ]] || return 1
+      ;;
+  esac
+  return 0
+}
+
+health_check() {
+  local c=$1 deadline=$((SECONDS + HEALTH_TIMEOUT))
+  while (( SECONDS < deadline )); do
+    sleep 3
+    if c_running "$c" && probe "$c"; then
+      sleep 3
+      if c_running "$c" && probe "$c"; then return 0; fi
+    fi
+  done
+  return 1
+}
+
+# Проверка нового образа до остановки старого контейнера
+preflight() {
+  local c=$1 img=$2 dir=$3
+  case $c in
+    amnezia-awg2)
+      docker run --rm --entrypoint sh "$img" -c 'command -v awg && command -v awg-quick' >/dev/null 2>&1 ;;
+    amnezia-awg|amnezia-wireguard)
+      docker run --rm --entrypoint sh "$img" -c 'command -v wg && command -v wg-quick' >/dev/null 2>&1 ;;
+    amnezia-xray)
+      docker run --rm --entrypoint /usr/bin/xray -v "$dir/xray:/opt/amnezia/xray:ro" "$img" \
+        run -test -config /opt/amnezia/xray/server.json >/dev/null 2>&1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# ---------------------------------------------------------------- обновление контейнера
+# Прошлое обновление прервалось (выключение, сбой)? Возвращаем прежний контейнер.
+recover_leftovers() {
+  local c=$1 prev="$1-aau-prev"
+  c_exists "$prev" || return 0
+  if (( DRY_RUN )); then
+    warn "$c: найден контейнер $prev от прерванного обновления, при запуске он будет возвращён"
+    return 0
+  fi
+  warn "$c: прошлое обновление не завершилось, возвращаю прежний контейнер"
+  docker rm -f "$c" >/dev/null 2>&1
+  docker rename "$prev" "$c" >/dev/null 2>&1 || { fail "$c: не смог переименовать $prev"; return 1; }
+  docker update --restart always "$c" >/dev/null 2>&1
+  docker start "$c" >/dev/null 2>&1 || fail "$c: не смог запустить прежний контейнер"
+  docker image rm "$c:aau-new" >/dev/null 2>&1
+  return 0
+}
+
+# Нужно ли обновление? Сравниваем с тем, из чего собран текущий контейнер. Причина в REASON.
+needs_update() {
+  local c=$1 up="$UP/${FOLDER_OF[$1]}" img base created age reasons=()
+  img=$(c_image "$c")
+  if [[ ! -f /opt/amnezia/$c/Dockerfile ]] \
+     || ! cmp -s <(tr -d '\r' < "/opt/amnezia/$c/Dockerfile") "$up/Dockerfile"; then
+    reasons+=("новый Dockerfile")
+  fi
+  while IFS= read -r base; do
+    [[ -z $base ]] && continue
+    if docker pull -q "$base" >/dev/null 2>&1; then
+      built_on_base "$img" "$base" || reasons+=("новый базовый образ $base")
+    else
+      warn "$c: не удалось скачать $base, базовый образ не проверен"
+    fi
+  done < <(dockerfile_bases "$up/Dockerfile")
+  if (( FORCE_REBUILD_DAYS > 0 )); then
+    created=$(docker image inspect -f '{{.Created}}' "$img" 2>/dev/null)
+    created=$(date -d "$created" +%s 2>/dev/null || echo 0)
+    age=$(( ($(date +%s) - created) / 86400 ))
+    (( age >= FORCE_REBUILD_DAYS )) && reasons+=("образу ${age} дн.")
+  fi
+  (( FORCE )) && reasons+=("принудительно")
+  REASON=$(printf '%s, ' "${reasons[@]}")
+  REASON=${REASON%, }
+  (( ${#reasons[@]} > 0 ))
+}
+
+rollback() {
+  local c=$1 prev=$2 old_img=$3 policy=$4 why=$5
+  fail "$c: $why, возвращаю прежний контейнер"
+  docker rm -f "$c" >/dev/null 2>&1
+  if docker rename "$prev" "$c" >/dev/null 2>&1; then
+    docker tag "$old_img" "$c:latest" >/dev/null 2>&1
+    docker update --restart "${policy:-always}" "$c" >/dev/null 2>&1
+    docker start "$c" >/dev/null 2>&1
+    if health_check "$c"; then
+      log "$c: прежний контейнер снова работает"
+    else
+      fail "$c: прежний контейнер не прошёл проверку, нужна ручная проверка (копия: $CUR_BACKUP)"
+    fi
+  else
+    fail "$c: не смог вернуть прежний контейнер, нужна ручная проверка (копия: $CUR_BACKUP)"
+  fi
+  docker image rm "$c:aau-new" >/dev/null 2>&1
+}
+
+# Скрипты запуска из релиза с текущими портом и подсетью -> RUN_SCRIPT, START_NEW
+prepare_run_scripts() {
+  local c=$1 up="$UP/${FOLDER_OF[$1]}" left
+  RUN_SCRIPT="$WORK/run-$c.sh"
+  START_NEW=""
+  render "$up/run_container.sh" "$RUN_SCRIPT"
+  left=$(leftover_vars "$RUN_SCRIPT")
+  if [[ -n $left ]] || ! docker_only_script "$RUN_SCRIPT"; then
+    fail "$c: run_container.sh в релизе $UP_TAG изменился (${left:-не только команды docker}), нужна проверка вручную"
+    return 1
+  fi
+  if [[ -f $up/start.sh ]]; then
+    render "$up/start.sh" "$WORK/start-$c.sh"
+    left=$(leftover_vars "$WORK/start-$c.sh")
+    if [[ -z $left ]]; then
+      START_NEW="$WORK/start-$c.sh"
+    else
+      warn "$c: в новом start.sh незнакомые переменные ($left), оставляю прежний start.sh"
+    fi
+  fi
+  return 0
+}
+
+# Переносит сохранённое /opt/amnezia (ключи, клиенты, start.sh) в контейнер и перезапускает его
+start_with_state() {
+  local c=$1 dir=$2
+  has_state "$c" || return 0
+  docker cp "$dir/." "$c:/opt/amnezia/" >/dev/null 2>&1 || return 1
+  if [[ -n $START_NEW ]]; then
+    docker cp "$START_NEW" "$c:/opt/amnezia/start.sh" >/dev/null 2>&1 || return 1
+  fi
+  docker exec "$c" chmod a+x /opt/amnezia/start.sh >/dev/null 2>&1
+  docker restart -t 5 "$c" >/dev/null 2>&1
+}
+
+# Проверка; если с новым start.sh не заработало, пробуем сохранённый
+verify_started() {
+  local c=$1 dir=$2
+  health_check "$c" && return 0
+  if [[ -n $START_NEW && -f $dir/start.sh ]]; then
+    warn "$c: с новым start.sh проверка не прошла, пробую прежний start.sh"
+    docker cp "$dir/start.sh" "$c:/opt/amnezia/start.sh" >/dev/null 2>&1
+    docker exec "$c" chmod a+x /opt/amnezia/start.sh >/dev/null 2>&1
+    docker restart -t 5 "$c" >/dev/null 2>&1
+    health_check "$c" && return 0
+  fi
+  return 1
+}
+
+# Кладём Dockerfile туда же, куда его кладёт приложение (по нему видно, из чего собран контейнер)
+store_dockerfile() {
+  local c=$1 owner=${2:-} up="$UP/${FOLDER_OF[$1]}"
+  if [[ -d /opt/amnezia/$c ]]; then
+    install -m 644 "$up/Dockerfile" "/opt/amnezia/$c/Dockerfile"
+    chown --reference="/opt/amnezia/$c" "/opt/amnezia/$c/Dockerfile" 2>/dev/null
+  else
+    install -D -m 644 "$up/Dockerfile" "/opt/amnezia/$c/Dockerfile"
+  fi
+  if [[ -n $owner ]]; then chown "$owner" "/opt/amnezia/$c" "/opt/amnezia/$c/Dockerfile" 2>/dev/null; fi
+  return 0
+}
+
+save_container_state() {
+  local c=$1
+  mkdir -p "$STATE_DIR/containers"
+  {
+    printf 'UPDATED_AT=%s\n' "$(date -Is)"
+    printf 'UPSTREAM_TAG=%s\n' "$UP_TAG"
+    printf 'REASON=%s\n' "$REASON"
+    printf 'IMAGE_ID=%s\n' "$(c_image "$c")"
+  } > "$STATE_DIR/containers/$c.state"
+}
+
+update_container() {
+  local c=$1 up="$UP/${FOLDER_OF[$1]}" prev="$1-aau-prev" new="$1:aau-new"
+  local stamp bk old_img policy extra=""
+
+  recover_leftovers "$c" || return 1
+  if ! c_running "$c"; then
+    log "$c: контейнер остановлен, пропускаю"
+    return 0
+  fi
+  if ! needs_update "$c"; then
+    log "$c: актуален (релиз $UP_TAG)"
+    return 0
+  fi
+  log "$c: нужно обновление: $REASON"
+  (( DRY_RUN )) && return 0
+
+  if ! ensure_free_space "$(docker_root)"; then
+    fail "$c: на диске меньше ${MIN_FREE_MB} МБ даже после очистки, обновление пропущено"
+    return 1
+  fi
+
+  [[ -n $RUN_STAMP ]] || RUN_STAMP=$(date +%Y%m%d-%H%M%S)
+  stamp=$RUN_STAMP
+  bk="$BACKUP_ROOT/$stamp/$c"
+  CUR_BACKUP=$bk
+  mkdir -p "$bk/opt-amnezia"
+  # 1. Копия состояния, пока контейнер работает
+  if has_state "$c" && ! docker cp "$c:/opt/amnezia/." "$bk/opt-amnezia/" >/dev/null 2>&1; then
+    fail "$c: не смог скопировать /opt/amnezia из контейнера, обновление пропущено"
+    return 1
+  fi
+  docker container inspect "$c" > "$bk/container.json" 2>/dev/null
+  extract_vars "$c" "$bk/opt-amnezia" || return 1
+  check_published_port "$c" || return 1
+  old_img=$(c_image "$c")
+  policy=$(c_restart_policy "$c")
+  set_expectations "$c" "$bk/opt-amnezia"
+
+  # 2. Сборка нового образа, старый контейнер в это время работает
+  mkdir -p "$WORK/build/$c"
+  cp "$up/Dockerfile" "$WORK/build/$c/Dockerfile"
+  log "$c: собираю образ по Dockerfile из релиза $UP_TAG"
+  if ! docker build --no-cache --pull -t "$new" "$WORK/build/$c" > "$bk/build.log" 2>&1; then
+    tail -n 15 "$bk/build.log"
+    fail "$c: сборка образа не удалась, контейнер не тронут (лог: $bk/build.log)"
+    docker image rm "$new" >/dev/null 2>&1
+    docker builder prune -af >/dev/null 2>&1
+    return 1
+  fi
+  if ! preflight "$c" "$new" "$bk/opt-amnezia"; then
+    fail "$c: новый образ не прошёл предварительную проверку, контейнер не тронут"
+    docker image rm "$new" >/dev/null 2>&1
+    return 1
+  fi
+  if ! prepare_run_scripts "$c"; then
+    docker image rm "$new" >/dev/null 2>&1
+    return 1
+  fi
+  if ! ensure_dns_network; then
+    fail "$c: не смог создать сеть $DNS_NET"
+    docker image rm "$new" >/dev/null 2>&1
+    return 1
+  fi
+
+  # 3. Переключение: с этого момента VPN недоступен несколько секунд
+  log "$c: останавливаю старый контейнер"
+  if ! docker stop -t 10 "$c" >/dev/null 2>&1; then
+    fail "$c: не смог остановить контейнер"
+    docker image rm "$new" >/dev/null 2>&1
+    return 1
+  fi
+  # Финальная копия уже из остановленного контейнера: ничего не потеряется,
+  # даже если клиента добавили во время сборки
+  if ! has_state "$c"; then
+    :
+  elif docker cp "$c:/opt/amnezia/." "$bk/opt-amnezia.final/" >/dev/null 2>&1; then
+    rm -rf "$bk/opt-amnezia"
+    mv "$bk/opt-amnezia.final" "$bk/opt-amnezia"
+  else
+    rm -rf "$bk/opt-amnezia.final"
+    warn "$c: не смог повторно скопировать /opt/amnezia, использую копию до остановки"
+  fi
+  docker update --restart no "$c" >/dev/null 2>&1   # чтобы после внезапной перезагрузки не запустились оба
+  if ! docker rename "$c" "$prev" >/dev/null 2>&1; then
+    docker update --restart "${policy:-always}" "$c" >/dev/null 2>&1
+    docker start "$c" >/dev/null 2>&1
+    fail "$c: не смог переименовать старый контейнер"
+    docker image rm "$new" >/dev/null 2>&1
+    return 1
+  fi
+  docker tag "$new" "$c:latest" >/dev/null 2>&1
+
+  log "$c: запускаю новый контейнер (run_container.sh из релиза $UP_TAG)"
+  bash "$RUN_SCRIPT" > "$bk/run.log" 2>&1
+  if ! c_exists "$c"; then
+    cat "$bk/run.log"
+    rollback "$c" "$prev" "$old_img" "$policy" "новый контейнер не создался"
+    return 1
+  fi
+
+  # 4. Перенос ключей, клиентов и start.sh, проверка
+  if ! start_with_state "$c" "$bk/opt-amnezia"; then
+    rollback "$c" "$prev" "$old_img" "$policy" "не смог перенести /opt/amnezia в новый контейнер"
+    return 1
+  fi
+  if ! verify_started "$c" "$bk/opt-amnezia"; then
+    rollback "$c" "$prev" "$old_img" "$policy" "новый контейнер не прошёл проверку"
+    return 1
+  fi
+
+  # 5. Готово: убираем старое
+  docker rm -f "$prev" >/dev/null 2>&1
+  docker image rm "$new" >/dev/null 2>&1
+  store_dockerfile "$c"
+  save_container_state "$c"
+  docker image prune -f >/dev/null 2>&1
+  docker builder prune -af >/dev/null 2>&1
+  [[ -n $EXPECT_PEERS ]] && extra=", клиентов: $EXPECT_PEERS"
+  change "$c обновлён до релиза $UP_TAG ($REASON)$extra"
+  return 0
+}
+
+# Оставляем KEEP_BACKUPS последних копий каждого контейнера, пустые папки запусков убираем
+prune_backups() {
+  [[ -d $BACKUP_ROOT ]] || return 0
+  local c d
+  while IFS= read -r c; do
+    [[ -z $c ]] && continue
+    find "$BACKUP_ROOT" -mindepth 2 -maxdepth 2 -type d -path "$BACKUP_ROOT/20*/$c" -printf '%P\n' 2>/dev/null \
+      | sort -r | tail -n +$((KEEP_BACKUPS + 1)) | while read -r d; do rm -rf "${BACKUP_ROOT:?}/$d"; done
+  done < <(find "$BACKUP_ROOT" -mindepth 2 -maxdepth 2 -type d -path "$BACKUP_ROOT/20*/*" -printf '%f\n' 2>/dev/null | sort -u)
+  find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -name '20*' -empty -delete 2>/dev/null
+  return 0
+}
+
+update_containers() {
+  if ! have_docker; then
+    log "Docker не запущен или не установлен, контейнеров Amnezia нет"
+    return 0
+  fi
+  local c all=() handled=" "
+  mapfile -t all < <(list_amnezia_containers)
+  if (( ${#all[@]} == 0 )); then
+    log "контейнеров Amnezia на сервере нет"
+    return 0
+  fi
+  prepare_upstream || return 1
+  for c in "${UPDATE_ORDER[@]}"; do
+    [[ -n $ONLY && $ONLY != "$c" ]] && continue
+    if printf '%s\n' "${all[@]}" | grep -qx -- "$c"; then
+      update_container "$c"
+      handled+="$c "
+    fi
+  done
+  for c in "${all[@]}"; do
+    [[ $handled == *" $c "* ]] && continue
+    [[ -n $ONLY && $ONLY != "$c" ]] && continue
+    log "$c: автообновление этого контейнера не поддерживается, обновляй через приложение"
+  done
+  (( DRY_RUN )) || prune_backups
+  return 0
+}
+
+# ---------------------------------------------------------------- ОС
+os_update() {
+  log "обновляю пакеты ОС"
+  ensure_free_space / || warn "на диске меньше ${MIN_FREE_MB} МБ свободного места"
+  if command -v apt-get >/dev/null 2>&1; then
+    local o=(-o DPkg::Lock::Timeout=1800 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+    local rc n up_n new_n
+    export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l   # l: только список; с "a" needrestart мог бы перезапустить и сам этот сервис посреди apt
+    dpkg --force-confdef --force-confold --configure -a >/dev/null 2>&1
+    if ! apt-get "${o[@]}" -yq update > "$WORK/apt-update.log" 2>&1; then
+      tail -n 15 "$WORK/apt-update.log"
+      fail "apt-get update завершился с ошибкой"
+      return 1
+    fi
+    apt-get "${o[@]}" -yq dist-upgrade 2>&1 | tee "$WORK/apt-upgrade.log" | grep -E '^(Setting up|Unpacking|Removing) ' | sed 's/^/  /'
+    rc=${PIPESTATUS[0]}
+    if (( rc != 0 )); then
+      tail -n 20 "$WORK/apt-upgrade.log"
+      fail "apt-get dist-upgrade завершился с кодом $rc"
+      return 1
+    fi
+    n=$(sed -nE 's/^([0-9]+) upgraded, ([0-9]+) newly installed, ([0-9]+) to remove.*/\1 \2 \3/p' "$WORK/apt-upgrade.log" | head -1)
+    apt-get "${o[@]}" -yq autoremove --purge > "$WORK/apt-autoremove.log" 2>&1 || warn "apt-get autoremove завершился с ошибкой"
+    apt-get clean >/dev/null 2>&1
+    read -r up_n new_n _ <<< "${n:-0 0 0}"
+    if (( up_n + new_n > 0 )); then
+      change "ОС: обновлено пакетов: $up_n, установлено новых: $new_n"
+    else
+      log "ОС: обновлений нет"
+    fi
+  elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+    local pm
+    pm=$(command -v dnf || command -v yum)
+    if "$pm" -y upgrade --refresh > "$WORK/dnf.log" 2>&1 || "$pm" -y update > "$WORK/dnf.log" 2>&1; then
+      if grep -qE '^(Upgraded|Installed):' "$WORK/dnf.log"; then change "ОС: пакеты обновлены ($pm)"; else log "ОС: обновлений нет"; fi
+      "$pm" -y autoremove >/dev/null 2>&1
+      "$pm" clean all >/dev/null 2>&1
+    else
+      tail -n 20 "$WORK/dnf.log"
+      fail "$pm upgrade завершился с ошибкой"
+      return 1
+    fi
+  else
+    warn "менеджер пакетов не найден (нужен apt-get, dnf или yum), ОС не обновляю"
+  fi
+  return 0
+}
+
+# Установлено ядро новее работающего той же сборки (generic, cloud-amd64 и т.п.)?
+# Печатает его версию. Нужно для Debian: он сам не создаёт /var/run/reboot-required.
+installed_newer_kernel() {
+  local running flavor newest
+  running=$(uname -r)
+  flavor=$(sed -nE 's/^[0-9]+\.[0-9]+[^-]*-[0-9]+[^-]*-(.+)$/\1/p' <<< "$running")
+  newest=$(find /boot -maxdepth 1 -name 'vmlinuz-*' -printf '%f\n' 2>/dev/null | sed 's/^vmlinuz-//' \
+           | grep -E -- "${flavor:+-${flavor}}\$" | sort -V | tail -1)
+  [[ -n $newest && $newest != "$running" ]] || return 1
+  [[ $(printf '%s\n' "$newest" "$running" | sort -V | tail -1) == "$newest" ]] || return 1
+  printf '%s' "$newest"
+}
+
+# Ради этого ядра уже перезагружались, а загрузилось другое: второй раз не перезагружаем
+kernel_reboot_tried() { [[ -n $1 && $(cat "$STATE_DIR/reboot-kernel" 2>/dev/null) == "$1" ]]; }
+
+reboot_required() {
+  local k
+  [[ -f /var/run/reboot-required ]] && return 0
+  if command -v needs-restarting >/dev/null 2>&1; then
+    needs-restarting -r >/dev/null 2>&1
+    [[ $? -eq 1 ]] && return 0
+  fi
+  if k=$(installed_newer_kernel) && ! kernel_reboot_tried "$k"; then return 0; fi
+  return 1
+}
+
+reboot_reason() {
+  local k
+  if [[ -f /var/run/reboot-required.pkgs ]]; then
+    sort -u /var/run/reboot-required.pkgs | tr '\n' ' ' | sed 's/ $//'
+  elif k=$(installed_newer_kernel); then
+    echo "установлено ядро $k, работает $(uname -r)"
+  else
+    echo "обновление ядра или системных библиотек"
+  fi
+}
+
+# ---------------------------------------------------------------- настройки хоста
+# setup_host_firewall.sh приложение запускает только при установке протокола, а его
+# sysctl и правила iptables не переживают перезагрузку. Применяем заново.
+host_setup() {
+  [[ $HOST_SETUP == yes ]] || return 0
+  have_docker || return 0
+  [[ -n $(list_amnezia_containers) ]] || return 0
+  local script=""
+  if [[ -n $UP && -f $UP/setup_host_firewall.sh ]]; then
+    script=$UP/setup_host_firewall.sh
+  elif [[ -f $STATE_DIR/upstream/current/setup_host_firewall.sh ]]; then
+    script=$STATE_DIR/upstream/current/setup_host_firewall.sh
+  elif prepare_upstream; then
+    script=$UP/setup_host_firewall.sh
+  fi
+  if [[ -z $script || ! -f $script ]]; then
+    warn "нет setup_host_firewall.sh, настройки хоста не применены"
+    return 0
+  fi
+  mkdir -p "$STATE_DIR"
+  bash "$script" > "$STATE_DIR/host-setup.log" 2>&1
+  log "сетевые настройки хоста применены (setup_host_firewall.sh, лог: $STATE_DIR/host-setup.log)"
+}
+
+# ---------------------------------------------------------------- развёртывание с нуля
+port_busy() {   # port_busy PORT udp|tcp
+  local flag=-lnt
+  [[ $2 == udp ]] && flag=-lnu
+  ss -H "$flag" "sport = :$1" 2>/dev/null | grep -q .
+}
+
+# Скрипт внутри контейнера, как SshSession::runContainerScript в приложении
+run_in_container() {   # run_in_container CONTAINER FILE [sh|bash]
+  local c=$1 f=$2 sh=${3:-bash} name
+  name="/opt/amnezia/aau-$RANDOM$RANDOM.sh"
+  docker exec -i "$c" mkdir -p /opt/amnezia || return 1
+  docker cp "$f" "$c:$name" >/dev/null || return 1
+  docker exec -i "$c" "$sh" "$name"
+  local rc=$?
+  docker exec -i "$c" rm -f "$name" >/dev/null 2>&1
+  return $rc
+}
+
+# Параметры AmneziaWG как в AwgInstaller::generateAwgParameters приложения.
+# HeaderProtectionKey это случайный ключ WireGuard, его даёт awg genkey из собранного образа.
+awg2_vars() {
+  local img=$1 hpk
+  hpk=$(docker run --rm --entrypoint awg "$img" genkey 2>/dev/null | tr -d '[:space:]')
+  [[ -n $hpk ]] || return 1
+  VARS+=(
+    "JUNK_PACKET_COUNT=$((4 + RANDOM % 3))"
+    "JUNK_PACKET_MIN_SIZE=10"
+    "JUNK_PACKET_MAX_SIZE=50"
+    "INIT_PACKET_JUNK_SIZE=12"
+    "RESPONSE_PACKET_JUNK_SIZE=12"
+    "COOKIE_REPLY_PACKET_JUNK_SIZE=12"
+    "TRANSPORT_PACKET_JUNK_SIZE=12"
+    "INIT_PACKET_MAGIC_HEADER=1"
+    "RESPONSE_PACKET_MAGIC_HEADER=2"
+    "UNDERLOAD_PACKET_MAGIC_HEADER=3"
+    "TRANSPORT_PACKET_MAGIC_HEADER=4"
+    "SPECIAL_JUNK_1=" "SPECIAL_JUNK_2=" "SPECIAL_JUNK_3=" "SPECIAL_JUNK_4=" "SPECIAL_JUNK_5="
+    "HEADER_PROTECTION_KEY=$hpk"
+    "CONTENT_PADDING_ADDITION="
+    "REKEY_AFTER_TIME=100-120"
+    "REKEY_TIMEOUT=3-7"
+    "REJECT_AFTER_TIME=150-180"
+    "KEEPALIVE_TIMEOUT=5-15"
+    "MAX_HANDSHAKE_ATTEMPTS=15-20"
+    "RANDOM_TRAILERS=on"
+    "DISABLE_COOKIES=on"
+  )
+}
+
+# server.json как XrayServerConfig::toServerInboundJson приложения (REALITY, tcp, vision)
+write_xray_server_json() {
+  local c=$1 port=$2 site=$3 dst=$4 uuid priv sid
+  uuid=$(docker exec "$c" cat /opt/amnezia/xray/xray_uuid.key 2>/dev/null | tr -d '[:space:]')
+  priv=$(docker exec "$c" cat /opt/amnezia/xray/xray_private.key 2>/dev/null | tr -d '[:space:]')
+  sid=$(docker exec "$c" cat /opt/amnezia/xray/xray_short_id.key 2>/dev/null | tr -d '[:space:]')
+  [[ -n $uuid && -n $priv && -n $sid ]] || return 1
+  jq -n --argjson port "$port" --arg uuid "$uuid" --arg pk "$priv" --arg sid "$sid" --arg site "$site" '{
+    inbounds: [{
+      port: $port,
+      protocol: "vless",
+      settings: { clients: [{ flow: "xtls-rprx-vision", id: $uuid }], decryption: "none" },
+      streamSettings: {
+        network: "tcp",
+        realitySettings: { dest: ($site + ":443"), privateKey: $pk, serverNames: [$site], shortIds: [$sid] },
+        security: "reality"
+      }
+    }],
+    log: { loglevel: "error" },
+    outbounds: [{ protocol: "freedom" }]
+  }' > "$dst"
+}
+
+# Новый контейнер не настроился: убираем его, чтобы не осталось полуготового протокола.
+# Volume xray не трогаем: там могут быть ключи прежней установки.
+deploy_failed() {
+  fail "$1: $2"
+  docker rm -f "$1" >/dev/null 2>&1
+  return 1
+}
+
+deploy_one() {
+  local proto=$1 port=$2 site=$3 c proto_net owner=${DEPLOY_OWNER:-}
+  case $proto in
+    awg|awg2|amneziawg) c=amnezia-awg2; port=${port:-$DEFAULT_AWG_PORT}; proto_net=udp ;;
+    wireguard|wg) c=amnezia-wireguard; port=${port:-$DEFAULT_WG_PORT}; proto_net=udp ;;
+    xray|vless|reality) c=amnezia-xray; port=${port:-$DEFAULT_XRAY_PORT}; proto_net=tcp ;;
+    dns|amneziadns) c=amnezia-dns; port=""; proto_net="" ;;
+    *) fail "неизвестный протокол: $proto (можно: awg, xray, wireguard, dns)"; return 1 ;;
+  esac
+  local up="$UP/${FOLDER_OF[$c]}"
+  if c_exists "$c"; then
+    log "$c уже установлен, пропускаю (обновлять его будет автообновление)"
+    return 0
+  fi
+  if [[ -n $port ]]; then
+    valid_port "$port" || { fail "$c: неверный порт $port"; return 1; }
+    if port_busy "$port" "$proto_net"; then fail "$c: порт $port/$proto_net уже занят"; return 1; fi
+  fi
+  ensure_free_space "$(docker_root)" || warn "мало свободного места на диске"
+  log "$c: устанавливаю по скриптам релиза $UP_TAG"
+
+  base_vars "$c"
+  case $c in
+    amnezia-awg2) VARS+=("AWG_SERVER_PORT=$port" "AWG_SUBNET_IP=$DEFAULT_SUBNET_IP" "WIREGUARD_SUBNET_CIDR=$DEFAULT_SUBNET_CIDR") ;;
+    amnezia-xray) VARS+=("XRAY_SERVER_PORT=$port" "XRAY_SITE_NAME=${site:-$DEFAULT_XRAY_SITE}") ;;
+    amnezia-wireguard) VARS+=("WIREGUARD_SERVER_PORT=$port" "WIREGUARD_SUBNET_IP=$DEFAULT_SUBNET_IP" "WIREGUARD_SUBNET_CIDR=$DEFAULT_SUBNET_CIDR") ;;
+  esac
+
+  # Сначала все скрипты релиза с подстановкой: если в релизе появились незнакомые
+  # параметры, ничего на сервере не меняем
+  render_checked "$UP/prepare_host.sh" "$WORK/prepare-$c.sh" "$c" || return 1
+  render_checked "$UP/build_container.sh" "$WORK/build-$c.sh" "$c" || return 1
+  render_checked "$up/run_container.sh" "$WORK/run-$c.sh" "$c" || return 1
+  if ! docker_only_script "$WORK/run-$c.sh"; then
+    fail "$c: в run_container.sh из релиза $UP_TAG не только команды docker, нужна проверка вручную"
+    return 1
+  fi
+  if [[ -f $up/start.sh ]]; then
+    render_checked "$up/start.sh" "$WORK/start-$c.sh" "$c" || return 1
+  fi
+
+  # prepare_host.sh: папка /opt/amnezia/<контейнер> и сеть amnezia-dns-net
+  bash "$WORK/prepare-$c.sh" >/dev/null 2>&1
+  ensure_dns_network || { fail "$c: не смог создать сеть $DNS_NET"; return 1; }
+  store_dockerfile "$c" "$owner"
+
+  # build_container.sh
+  if ! bash "$WORK/build-$c.sh" > "$WORK/build-$c.log" 2>&1 || ! docker image inspect "$c" >/dev/null 2>&1; then
+    tail -n 20 "$WORK/build-$c.log"
+    fail "$c: сборка образа не удалась"
+    return 1
+  fi
+
+  # configure_container.sh (выполняется внутри контейнера)
+  if [[ $c == amnezia-awg2 ]]; then
+    awg2_vars "$c" || { fail "$c: не смог сгенерировать HeaderProtectionKey"; return 1; }
+  fi
+  if [[ -s $up/configure_container.sh ]]; then
+    render_checked "$up/configure_container.sh" "$WORK/configure-$c.sh" "$c" || return 1
+  fi
+
+  # run_container.sh
+  bash "$WORK/run-$c.sh" > "$WORK/run-$c.log" 2>&1
+  if ! c_running "$c"; then
+    cat "$WORK/run-$c.log"
+    deploy_failed "$c" "контейнер не запустился"
+    return 1
+  fi
+
+  if [[ -s $WORK/configure-$c.sh ]]; then
+    if ! run_in_container "$c" "$WORK/configure-$c.sh" > "$WORK/configure-$c.log" 2>&1 \
+       || grep -q 'amnezia_xray_keygen=failed' "$WORK/configure-$c.log"; then
+      cat "$WORK/configure-$c.log"
+      deploy_failed "$c" "настройка контейнера не удалась"
+      return 1
+    fi
+  fi
+  if [[ $c == amnezia-xray ]]; then
+    if ! write_xray_server_json "$c" "$port" "${site:-$DEFAULT_XRAY_SITE}" "$WORK/server.json" \
+       || ! docker cp "$WORK/server.json" "$c:/opt/amnezia/xray/server.json" >/dev/null; then
+      deploy_failed "$c" "не смог записать server.json"
+      return 1
+    fi
+  fi
+
+  # setup_host_firewall.sh и start.sh, как в конце установки в приложении
+  bash "$UP/setup_host_firewall.sh" > "$WORK/firewall.log" 2>&1
+  if [[ -f $WORK/start-$c.sh ]]; then
+    docker cp "$WORK/start-$c.sh" "$c:/opt/amnezia/start.sh" >/dev/null
+    docker exec -d "$c" sh -c "chmod a+x /opt/amnezia/start.sh && /opt/amnezia/start.sh"
+  fi
+
+  EXPECT_PORT=$port
+  EXPECT_PEERS=""
+  EXPECT_PUBKEY=""
+  [[ $c == amnezia-awg2 || $c == amnezia-wireguard ]] && EXPECT_PEERS=0
+  if ! health_check "$c"; then
+    docker logs --tail 20 "$c" 2>&1
+    deploy_failed "$c" "контейнер установлен, но проверка не прошла, убрал его"
+    return 1
+  fi
+  REASON="установка"
+  save_container_state "$c"
+  change "$c установлен (порт ${port:-нет}, релиз $UP_TAG)"
+  return 0
+}
+
+# ---------------------------------------------------------------- перенос на другой сервер
+ensure_docker() {
+  have_docker && return 0
+  log "ставлю Docker (install_docker.sh из релиза $UP_TAG)"
+  bash "$UP/install_docker.sh" > "$WORK/install-docker.log" 2>&1
+  if ! have_docker; then
+    tail -n 20 "$WORK/install-docker.log"
+    fail "не удалось установить Docker"
+    return 1
+  fi
+  return 0
+}
+
+# Ожидания для импортированного контейнера: ключ сервера из PrivateKey, клиенты из конфига
+set_import_expectations() {
+  local c=$1 dir=$2 tool ifc priv conf
+  EXPECT_PUBKEY=""
+  EXPECT_PEERS=""
+  case $c in
+    amnezia-awg2|amnezia-awg|amnezia-wireguard)
+      read -r tool ifc <<< "$(wg_tool "$c")"
+      conf="$dir/$(wg_conf_rel "$c")"
+      priv=$(conf_get "$conf" PrivateKey)
+      EXPECT_PUBKEY=$(printf '%s\n' "$priv" | docker run --rm -i --entrypoint "$tool" "$c" pubkey 2>/dev/null)
+      EXPECT_PEERS=$(grep -cE '^[[:space:]]*\[Peer\]' "$conf" 2>/dev/null)
+      ;;
+  esac
+}
+
+import_container() {
+  local c=$1 dir=$2 proto_net=udp
+  if c_exists "$c"; then
+    fail "$c уже есть на этом сервере, импорт пропущен (сначала удали его в приложении Amnezia)"
+    return 1
+  fi
+  extract_vars "$c" "$dir" || return 1
+  [[ $c == amnezia-xray ]] && proto_net=tcp
+  if [[ -n $EXPECT_PORT ]] && port_busy "$EXPECT_PORT" "$proto_net"; then
+    fail "$c: порт $EXPECT_PORT/$proto_net на этом сервере уже занят"
+    return 1
+  fi
+  ensure_free_space "$(docker_root)" || warn "мало свободного места на диске"
+  log "$c: импортирую (порт ${EXPECT_PORT:-нет}) по скриптам релиза $UP_TAG"
+
+  render "$UP/prepare_host.sh" "$WORK/prepare-$c.sh"
+  bash "$WORK/prepare-$c.sh" >/dev/null 2>&1
+  ensure_dns_network || { fail "$c: не смог создать сеть $DNS_NET"; return 1; }
+  store_dockerfile "$c" "$DEPLOY_OWNER"
+  render "$UP/build_container.sh" "$WORK/build-$c.sh"
+  if ! bash "$WORK/build-$c.sh" > "$WORK/build-$c.log" 2>&1 || ! docker image inspect "$c" >/dev/null 2>&1; then
+    tail -n 20 "$WORK/build-$c.log"
+    fail "$c: сборка образа не удалась"
+    return 1
+  fi
+  if ! preflight "$c" "$c" "$dir"; then
+    fail "$c: новый образ не принимает сохранённую конфигурацию"
+    return 1
+  fi
+  set_import_expectations "$c" "$dir"
+  prepare_run_scripts "$c" || return 1
+  bash "$RUN_SCRIPT" > "$WORK/run-$c.log" 2>&1
+  if ! c_exists "$c"; then
+    cat "$WORK/run-$c.log"
+    fail "$c: контейнер не создался"
+    return 1
+  fi
+  if ! start_with_state "$c" "$dir"; then
+    fail "$c: не смог перенести /opt/amnezia в контейнер"
+    return 1
+  fi
+  if ! verify_started "$c" "$dir"; then
+    fail "$c: импортирован, но проверка не прошла (интерфейс, порт, ключ или клиенты)"
+    return 1
+  fi
+  REASON="импорт"
+  save_container_state "$c"
+  change "$c импортирован${EXPECT_PEERS:+, клиентов: $EXPECT_PEERS}"
+  return 0
+}
+
+cmd_export() {
+  local out=${1:-} c stage n=0
+  need_root
+  exec 3>&1 1>&2        # журнал в stderr, чтобы "export -" отдавал в stdout только архив
+  init_work
+  have_docker || die "Docker не запущен, экспортировать нечего"
+  [[ -z $out ]] && out="/root/amnezia-export-$(hostname -s 2>/dev/null || hostname)-$(date +%Y%m%d-%H%M%S).tar.gz"
+  stage="$WORK/export"
+  mkdir -p "$stage"
+  while IFS= read -r c; do
+    [[ -z $c ]] && continue
+    if [[ -z ${FOLDER_OF[$c]:-} ]]; then
+      warn "$c: перенос этого контейнера не поддерживается, в экспорт не попадёт"
+      continue
+    fi
+    mkdir -p "$stage/$c/opt-amnezia"
+    if has_state "$c" && ! docker cp "$c:/opt/amnezia/." "$stage/$c/opt-amnezia/" >/dev/null 2>&1; then
+      fail "$c: не смог скопировать /opt/amnezia"
+      rm -rf "${stage:?}/$c"
+      continue
+    fi
+    docker container inspect "$c" > "$stage/$c/container.json" 2>/dev/null
+    n=$((n + 1))
+    log "$c: добавлен в экспорт"
+  done < <(list_amnezia_containers)
+  (( n > 0 )) || die "нечего экспортировать: нет поддерживаемых контейнеров Amnezia"
+  printf 'FORMAT=1\nTOOL=%s %s\nHOST=%s\nIP=%s\nDATE=%s\n' \
+    "$PROG" "$VERSION" "$(server_label)" "$(primary_ip)" "$(date -Is)" > "$stage/manifest"
+  if [[ $out == - ]]; then
+    tar -C "$stage" -czf - . >&3 || die "не смог записать архив"
+  else
+    tar -C "$stage" -czf "$out" . || die "не смог записать $out"
+    chmod 600 "$out"
+    log "экспорт готов: $out"
+  fi
+  log "в архиве приватные ключи сервера и клиентов, храни его как пароль"
+  (( ${#ERRORS[@]} == 0 ))
+}
+
+cmd_import() {
+  local file="" c n=0 old_ip new_ip
+  while (( $# )); do
+    case $1 in
+      --owner) DEPLOY_OWNER=${2:-}; shift ;;
+      -*) die "неизвестный параметр: $1" ;;
+      *) file=$1 ;;
+    esac
+    shift
+  done
+  [[ -n $file && -f $file ]] || die "укажи файл экспорта: $PROG import /root/amnezia-export-....tar.gz"
+  need_root
+  init_work
+  acquire_lock
+  start_logging
+  log "=== $PROG $VERSION: импорт из $file ==="
+  mkdir -p "$WORK/import"
+  tar --no-same-owner -xzf "$file" -C "$WORK/import" || die "не смог распаковать $file"
+  [[ -f $WORK/import/manifest ]] || die "$file не похож на экспорт $PROG"
+  log "экспорт сделан на $(sed -n 's/^HOST=//p' "$WORK/import/manifest"), $(sed -n 's/^DATE=//p' "$WORK/import/manifest")"
+  old_ip=$(sed -n 's/^IP=//p' "$WORK/import/manifest")
+  new_ip=$(primary_ip)
+  if [[ -n $old_ip && -n $new_ip && $old_ip != "$new_ip" ]]; then
+    warn "IP в экспорте $old_ip, у этого сервера $new_ip. Если в приложении сервер добавлен по IP, пользователям понадобятся новые конфиги"
+  fi
+  prepare_upstream || { finish_run; return 1; }
+  ensure_docker || { finish_run; return 1; }
+  for c in "${UPDATE_ORDER[@]}"; do
+    [[ -d $WORK/import/$c/opt-amnezia ]] || continue
+    import_container "$c" "$WORK/import/$c/opt-amnezia" && n=$((n + 1))
+  done
+  (( n > 0 )) && host_setup
+  finish_run
+  (( ${#ERRORS[@]} == 0 ))
+}
+
+# ---------------------------------------------------------------- установка самого инструмента
+BIN_PATH="/usr/local/sbin/amnezia-autoupdate"
+UNIT_DIR="/etc/systemd/system"
+
+default_config() {
+  cat <<'EOF'
+# Настройки amnezia-autoupdate. После изменения времени запуска выполни:
+#   amnezia-autoupdate install
+# (установка повторно применит расписание, остальное читается при каждом запуске)
+
+# Когда обновляться: время, часовой пояс и случайная задержка,
+# чтобы серверы не перезагружались одновременно
+UPDATE_TIME="04:00"
+UPDATE_TZ="Europe/Moscow"
+RANDOM_DELAY="30min"
+
+# Что обновлять
+OS_UPDATE="yes"
+CONTAINERS_UPDATE="yes"
+# Заново применять сетевые настройки хоста из setup_host_firewall.sh приложения
+HOST_SETUP="yes"
+
+# Перезагрузка: if-needed (только если её требует обновление ядра и т.п.), never, always
+REBOOT="if-needed"
+
+# Откуда брать серверные скрипты Amnezia
+UPSTREAM_REPO="amnezia-vpn/amnezia-client"
+# latest = последний релиз приложения, или конкретный тег, например "5.1.0.6"
+UPSTREAM_REF="latest"
+
+# Пересобирать контейнер раз в N дней, даже если ничего не изменилось (0 = не нужно)
+FORCE_REBUILD_DAYS="0"
+# Сколько последних резервных копий /opt/amnezia хранить для каждого контейнера
+KEEP_BACKUPS="10"
+# Если свободно меньше (МБ), сначала чистим кэш; без места образ не собираем
+MIN_FREE_MB="1500"
+
+# Уведомления в Telegram (необязательно): токен бота от @BotFather и id чата
+TELEGRAM_BOT_TOKEN=""
+TELEGRAM_CHAT_ID=""
+# changes = об изменениях и ошибках, errors = только об ошибках, always, never
+NOTIFY="changes"
+# Имя сервера в уведомлениях (по умолчанию hostname)
+SERVER_NAME=""
+
+# Откуда брать новую версию этого скрипта для "amnezia-autoupdate self-update"
+SELF_UPDATE_URL="https://raw.githubusercontent.com/iF-22/amnezia-autoupdate/main/amnezia-autoupdate"
+EOF
+}
+
+set_conf() {   # set_conf KEY VALUE
+  local key=$1 val=$2 esc
+  esc=$(printf '%s' "$val" | sed -e 's/[\\"$`]/\\&/g')
+  if grep -qE "^${key}=" "$CONF_FILE"; then
+    KEY="$key" VAL="$esc" awk 'BEGIN { k = ENVIRON["KEY"]; v = ENVIRON["VAL"] }
+      index($0, k "=") == 1 { print k "=\"" v "\""; next } { print }' "$CONF_FILE" > "$CONF_FILE.tmp" \
+      && cat "$CONF_FILE.tmp" > "$CONF_FILE" && rm -f "$CONF_FILE.tmp"
+  else
+    printf '%s="%s"\n' "$key" "$esc" >> "$CONF_FILE"
+  fi
+}
+
+install_deps() {
+  local missing=()
+  command -v curl >/dev/null 2>&1 || missing+=(curl)
+  command -v jq >/dev/null 2>&1 || missing+=(jq)
+  command -v ss >/dev/null 2>&1 || missing+=(ss)
+  command -v flock >/dev/null 2>&1 || missing+=(flock)
+  (( ${#missing[@]} == 0 )) && return 0
+  log "ставлю нужные пакеты: ${missing[*]}"
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get -o DPkg::Lock::Timeout=600 -yq update >/dev/null 2>&1
+    apt-get -o DPkg::Lock::Timeout=600 -yq install --no-install-recommends \
+      curl ca-certificates jq iproute2 util-linux >/dev/null 2>&1 || die "не удалось поставить curl/jq/iproute2"
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf -y install curl ca-certificates jq iproute util-linux >/dev/null 2>&1 || die "не удалось поставить curl/jq/iproute"
+  elif command -v yum >/dev/null 2>&1; then
+    yum -y install curl ca-certificates jq iproute util-linux >/dev/null 2>&1 || die "не удалось поставить curl/jq/iproute"
+  else
+    die "нужны пакеты: ${missing[*]}"
+  fi
+}
+
+write_units() {
+  local cal="*-*-* ${UPDATE_TIME}:00" delay=${RANDOM_DELAY:-30min}
+  [[ $UPDATE_TIME =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || die "время должно быть в формате ЧЧ:ММ, а не '$UPDATE_TIME'"
+  if [[ -n ${UPDATE_TZ:-} ]]; then
+    if systemd-analyze calendar "$cal $UPDATE_TZ" >/dev/null 2>&1; then
+      cal="$cal $UPDATE_TZ"
+    else
+      warn "systemd не понимает часовой пояс '$UPDATE_TZ', время $UPDATE_TIME будет по часам сервера"
+    fi
+  fi
+  [[ $delay =~ ^[0-9]+(s|min|m|h)?$ ]] || delay=30min
+
+  cat > "$UNIT_DIR/amnezia-autoupdate.service" <<EOF
+[Unit]
+Description=Amnezia VPN auto-update (OS packages and Amnezia containers)
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+ExecStart=$BIN_PATH run
+TimeoutStartSec=2h
+Nice=10
+EOF
+  cat > "$UNIT_DIR/amnezia-autoupdate.timer" <<EOF
+[Unit]
+Description=Daily Amnezia VPN auto-update
+
+[Timer]
+OnCalendar=$cal
+RandomizedDelaySec=$delay
+AccuracySec=1min
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+EOF
+  cat > "$UNIT_DIR/amnezia-hostsetup.service" <<EOF
+[Unit]
+Description=Amnezia VPN: re-apply host network settings after boot
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+ExecStart=$BIN_PATH host-setup
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 644 "$UNIT_DIR"/amnezia-autoupdate.service "$UNIT_DIR"/amnezia-autoupdate.timer "$UNIT_DIR"/amnezia-hostsetup.service
+  systemctl daemon-reload
+  systemctl enable --now amnezia-autoupdate.timer >/dev/null 2>&1 || die "не удалось включить таймер"
+  systemctl enable amnezia-hostsetup.service >/dev/null 2>&1 || warn "не удалось включить amnezia-hostsetup.service"
+  log "расписание: каждый день в $cal, плюс случайная задержка до $delay"
+}
+
+cmd_install() {
+  local deploy="" import_file="" update_now=0 journal_max="200M" self target extra=() a
+  local -A setv=()
+  while (( $# )); do
+    a=$1
+    case $a in
+      --time) setv[UPDATE_TIME]=${2:-}; shift ;;
+      --tz) setv[UPDATE_TZ]=${2:-}; shift ;;
+      --delay) setv[RANDOM_DELAY]=${2:-}; shift ;;
+      --reboot) setv[REBOOT]=${2:-}; shift ;;
+      --no-os-update) setv[OS_UPDATE]=no ;;
+      --telegram-token) setv[TELEGRAM_BOT_TOKEN]=${2:-}; shift ;;
+      --telegram-chat) setv[TELEGRAM_CHAT_ID]=${2:-}; shift ;;
+      --name) setv[SERVER_NAME]=${2:-}; shift ;;
+      --upstream-ref) setv[UPSTREAM_REF]=${2:-}; shift ;;
+      --self-update-url) setv[SELF_UPDATE_URL]=${2:-}; shift ;;
+      --journal-max) journal_max=${2:-}; shift ;;
+      --deploy) deploy=${2:-awg}; shift ;;
+      --import) import_file=${2:-}; shift ;;
+      --awg-port|--xray-port|--wg-port|--xray-site) extra+=("$a" "${2:-}"); shift ;;
+      --update-now) update_now=1 ;;
+      *) die "неизвестный параметр: $a (см. $PROG help)" ;;
+    esac
+    shift
+  done
+  need_root
+  init_work
+  case ${setv[REBOOT]:-if-needed} in if-needed|never|always) ;; *) die "--reboot: if-needed, never или always" ;; esac
+  [[ -z $import_file || -f $import_file ]] || die "нет файла $import_file"
+  command -v systemctl >/dev/null 2>&1 || die "нужен systemd"
+
+  log "=== установка $PROG $VERSION ==="
+  install_deps
+
+  self=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null)
+  [[ -f $self ]] || die "запусти так: sudo bash amnezia-autoupdate install (из файла, а не через пайп)"
+  if [[ $self != "$BIN_PATH" ]]; then
+    install -m 755 "$self" "$BIN_PATH.new"
+    sed -i 's/\r$//' "$BIN_PATH.new"
+    bash -n "$BIN_PATH.new" || die "файл скрипта повреждён"
+    mv -f "$BIN_PATH.new" "$BIN_PATH"
+  fi
+  log "скрипт: $BIN_PATH"
+
+  if [[ ! -f $CONF_FILE ]]; then
+    default_config > "$CONF_FILE"
+    log "настройки: $CONF_FILE (созданы)"
+  else
+    log "настройки: $CONF_FILE (сохранены прежние)"
+  fi
+  chmod 600 "$CONF_FILE"
+  for target in "${!setv[@]}"; do set_conf "$target" "${setv[$target]}"; done
+  load_config
+  UPDATE_TIME=$(sed -n 's/^UPDATE_TIME="\(.*\)"$/\1/p' "$CONF_FILE" | tail -1)
+  UPDATE_TZ=$(sed -n 's/^UPDATE_TZ="\(.*\)"$/\1/p' "$CONF_FILE" | tail -1)
+  RANDOM_DELAY=$(sed -n 's/^RANDOM_DELAY="\(.*\)"$/\1/p' "$CONF_FILE" | tail -1)
+  UPDATE_TIME=${UPDATE_TIME:-04:00}
+
+  write_units
+
+  if [[ -n $journal_max && $journal_max != 0 ]]; then
+    mkdir -p /etc/systemd/journald.conf.d
+    printf '[Journal]\nSystemMaxUse=%s\n' "$journal_max" > /etc/systemd/journald.conf.d/60-amnezia-autoupdate.conf
+    chmod 644 /etc/systemd/journald.conf.d/60-amnezia-autoupdate.conf
+    systemctl restart systemd-journald >/dev/null 2>&1
+    log "системный журнал ограничен до $journal_max (диск небольшой)"
+  fi
+  if [[ -d /etc/logrotate.d ]]; then
+    cat > /etc/logrotate.d/amnezia-autoupdate <<EOF
+$LOG_FILE {
+  weekly
+  rotate 4
+  maxsize 5M
+  compress
+  missingok
+  notifempty
+}
+EOF
+    chmod 644 /etc/logrotate.d/amnezia-autoupdate
+  fi
+  log "установка завершена"
+
+  local owner=${SUDO_USER:-}
+  [[ $owner == root ]] && owner=""
+  if [[ -n $import_file ]]; then
+    "$BIN_PATH" import "$import_file" ${owner:+--owner "$owner"} || return 1
+  fi
+  if [[ -n $deploy ]]; then
+    "$BIN_PATH" deploy "$deploy" "${extra[@]}" ${owner:+--owner "$owner"} || return 1
+  fi
+  if (( update_now )); then
+    "$BIN_PATH" run --no-reboot
+  else
+    "$BIN_PATH" check
+    log "обновить прямо сейчас: sudo $PROG run --no-reboot, статус: sudo $PROG status"
+  fi
+}
+
+cmd_uninstall() {
+  local purge=0
+  [[ ${1:-} == --purge ]] && purge=1
+  need_root
+  systemctl disable --now amnezia-autoupdate.timer amnezia-hostsetup.service >/dev/null 2>&1
+  rm -f "$UNIT_DIR/amnezia-autoupdate.service" "$UNIT_DIR/amnezia-autoupdate.timer" "$UNIT_DIR/amnezia-hostsetup.service" \
+        /etc/systemd/journald.conf.d/60-amnezia-autoupdate.conf /etc/logrotate.d/amnezia-autoupdate
+  systemctl daemon-reload >/dev/null 2>&1
+  if (( purge )); then
+    rm -rf "$STATE_DIR" "$BACKUP_ROOT" "$CONF_FILE" "$LOG_FILE"
+    echo "удалены таймер, настройки, резервные копии и журнал"
+  else
+    echo "таймер удалён; настройки ($CONF_FILE) и резервные копии ($BACKUP_ROOT) оставлены"
+  fi
+  rm -f "$BIN_PATH"
+  echo "контейнеры Amnezia не тронуты"
+}
+
+cmd_self_update() {
+  need_root
+  init_work
+  [[ -n $SELF_UPDATE_URL ]] || die "не задан SELF_UPDATE_URL в $CONF_FILE"
+  curl -fsSL --max-time 60 "$SELF_UPDATE_URL" -o "$WORK/new" || die "не удалось скачать $SELF_UPDATE_URL"
+  sed -i 's/\r$//' "$WORK/new"
+  bash -n "$WORK/new" || die "скачанный файл не похож на скрипт"
+  grep -q '^PROG="amnezia-autoupdate"' "$WORK/new" || die "скачанный файл не похож на $PROG"
+  install -m 755 "$WORK/new" "$BIN_PATH"
+  echo "обновлён до $(bash "$BIN_PATH" version)"
+}
+
+# ---------------------------------------------------------------- команды
+summary_text() {
+  local line out
+  out="[$(server_label)] Amnezia autoupdate"
+  if (( ${#ERRORS[@]} > 0 )); then out+=$'\n'"Ошибки:"; for line in "${ERRORS[@]}"; do out+=$'\n'"• $line"; done; fi
+  if (( ${#CHANGES[@]} > 0 )); then out+=$'\n'"Изменения:"; for line in "${CHANGES[@]}"; do out+=$'\n'"• $line"; done; fi
+  if (( ${#WARNINGS[@]} > 0 )); then out+=$'\n'"Предупреждения:"; for line in "${WARNINGS[@]}"; do out+=$'\n'"• $line"; done; fi
+  if (( ${#ERRORS[@]} + ${#CHANGES[@]} + ${#WARNINGS[@]} == 0 )); then out+=$'\n'"Всё актуально, изменений нет."; fi
+  printf '%s' "$out"
+}
+
+finish_run() {
+  local text result
+  text=$(summary_text)
+  result="ok"
+  (( ${#ERRORS[@]} > 0 )) && result="errors"
+  mkdir -p "$STATE_DIR"
+  { printf 'FINISHED_AT=%s\nRESULT=%s\n' "$(date -Is)" "$result"; printf '%s\n' "$text"; } > "$STATE_DIR/last-run"
+  case $NOTIFY in
+    always) notify "$text" ;;
+    changes) (( ${#ERRORS[@]} + ${#CHANGES[@]} > 0 )) && notify "$text" ;;
+    errors) (( ${#ERRORS[@]} > 0 )) && notify "$text" ;;
+  esac
+  log "итог: $result"
+}
+
+cmd_run() {
+  local do_os=$OS_UPDATE do_containers=$CONTAINERS_UPDATE
+  while (( $# )); do
+    case $1 in
+      --no-os) do_os=no ;;
+      --no-containers) do_containers=no ;;
+      --no-reboot) NO_REBOOT=1 ;;
+      --force) FORCE=1 ;;
+      --only) ONLY=${2:-}; shift ;;
+      *) die "неизвестный параметр: $1" ;;
+    esac
+    shift
+  done
+  need_root
+  init_work
+  acquire_lock
+  start_logging
+  log "=== $PROG $VERSION: запуск на $(server_label) ==="
+  [[ $do_os == yes ]] && os_update
+  [[ $do_containers == yes ]] && update_containers
+  host_setup
+  cleanup_light
+  local reboot_why=""
+  case $REBOOT in
+    always) reboot_why="REBOOT=always" ;;
+    never) reboot_required && warn "нужна перезагрузка ($(reboot_reason)), но REBOOT=never" ;;
+    *) reboot_required && reboot_why=$(reboot_reason) ;;
+  esac
+  local k
+  if k=$(installed_newer_kernel) && kernel_reboot_tried "$k"; then
+    warn "после перезагрузки работает ядро $(uname -r), а не установленное $k, проверь загрузчик"
+  fi
+  if [[ -n $reboot_why ]]; then
+    if (( NO_REBOOT )); then
+      warn "нужна перезагрузка ($reboot_why), запуск с --no-reboot"
+      reboot_why=""
+    else
+      change "перезагрузка сервера: $reboot_why"
+    fi
+  fi
+  finish_run
+  if [[ -n $reboot_why ]]; then
+    if k=$(installed_newer_kernel); then mkdir -p "$STATE_DIR"; printf '%s\n' "$k" > "$STATE_DIR/reboot-kernel"; fi
+    log "перезагружаю сервер через минуту"
+    sync
+    shutdown -r +1 "amnezia-autoupdate: $reboot_why" >/dev/null 2>&1 || systemctl --no-block reboot
+  fi
+  (( ${#ERRORS[@]} == 0 ))
+}
+
+cmd_check() {
+  need_root
+  init_work
+  DRY_RUN=1
+  log "=== проверка (ничего не меняется) ==="
+  if command -v apt-get >/dev/null 2>&1; then
+    if apt-get -o DPkg::Lock::Timeout=60 -qq update >/dev/null 2>&1; then
+      local n
+      n=$(apt-get -s -o Debug::NoLocking=1 dist-upgrade 2>/dev/null | grep -c '^Inst ')
+      log "ОС: пакетов к обновлению: $n"
+    else
+      warn "apt-get update не прошёл"
+    fi
+  fi
+  reboot_required && log "ОС: нужна перезагрузка ($(reboot_reason))"
+  update_containers
+  log "свободно на диске: $(free_mb /) МБ"
+  (( ${#ERRORS[@]} == 0 ))
+}
+
+cmd_status() {
+  local c state line
+  echo "$PROG $VERSION"
+  if command -v systemctl >/dev/null 2>&1; then
+    line=$(systemctl list-timers amnezia-autoupdate.timer --no-pager --no-legend 2>/dev/null | head -1)
+    echo "Следующий запуск: ${line:-таймер не найден}"
+  fi
+  if [[ -f $STATE_DIR/last-run ]]; then
+    echo "Последний запуск:"
+    sed 's/^/  /' "$STATE_DIR/last-run"
+  else
+    echo "Последний запуск: ещё не было"
+  fi
+  [[ -f $STATE_DIR/upstream/current/.tag ]] && echo "Скрипты Amnezia: релиз $(cat "$STATE_DIR/upstream/current/.tag")"
+  if have_docker; then
+    echo "Контейнеры:"
+    while IFS= read -r c; do
+      [[ -z $c ]] && continue
+      state="остановлен"
+      c_running "$c" && state="работает"
+      line="  $c: $state, образ от $(docker image inspect -f '{{.Created}}' "$(c_image "$c")" 2>/dev/null | cut -c1-16)"
+      if [[ -f $STATE_DIR/containers/$c.state ]]; then
+        line+=", обновлён $(sed -n 's/^UPDATED_AT=//p' "$STATE_DIR/containers/$c.state" | cut -c1-16)"
+        line+=" (релиз $(sed -n 's/^UPSTREAM_TAG=//p' "$STATE_DIR/containers/$c.state"))"
+      fi
+      [[ -z ${FOLDER_OF[$c]:-} ]] && line+=", автообновление не поддерживается"
+      echo "$line"
+    done < <(list_amnezia_containers)
+  else
+    echo "Docker не запущен"
+  fi
+  echo "Свободно на диске: $(free_mb /) МБ"
+  if reboot_required; then echo "Нужна перезагрузка: да ($(reboot_reason))"; else echo "Нужна перезагрузка: нет"; fi
+}
+
+cmd_update_containers() {
+  while (( $# )); do
+    case $1 in
+      --force) FORCE=1 ;;
+      --only) ONLY=${2:-}; shift ;;
+      *) die "неизвестный параметр: $1" ;;
+    esac
+    shift
+  done
+  need_root
+  init_work
+  acquire_lock
+  start_logging
+  log "=== $PROG $VERSION: обновление контейнеров ==="
+  update_containers
+  finish_run
+  (( ${#ERRORS[@]} == 0 ))
+}
+
+cmd_update_os() {
+  need_root
+  init_work
+  acquire_lock
+  start_logging
+  log "=== $PROG $VERSION: обновление ОС ==="
+  os_update
+  reboot_required && warn "нужна перезагрузка: $(reboot_reason)"
+  finish_run
+  (( ${#ERRORS[@]} == 0 ))
+}
+
+cmd_host_setup() {
+  need_root
+  init_work
+  if have_docker; then
+    local c
+    for c in "${UPDATE_ORDER[@]}"; do recover_leftovers "$c"; done
+  fi
+  host_setup
+}
+
+cmd_deploy() {
+  local protos=() port_awg="" port_xray="" port_wg="" site="" p
+  while (( $# )); do
+    case $1 in
+      --awg-port) port_awg=${2:-}; shift ;;
+      --xray-port) port_xray=${2:-}; shift ;;
+      --wg-port) port_wg=${2:-}; shift ;;
+      --xray-site) site=${2:-}; shift ;;
+      --owner) DEPLOY_OWNER=${2:-root}; shift ;;
+      -*) die "неизвестный параметр: $1" ;;
+      *) IFS=', ' read -r -a p <<< "$1"; protos+=("${p[@]}") ;;
+    esac
+    shift
+  done
+  (( ${#protos[@]} )) || protos=(awg)
+  need_root
+  init_work
+  acquire_lock
+  start_logging
+  log "=== $PROG $VERSION: установка ${protos[*]} ==="
+  prepare_upstream || { finish_run; return 1; }
+  ensure_docker || { finish_run; return 1; }
+  for p in "${protos[@]}"; do
+    [[ -z $p ]] && continue
+    case $p in
+      awg|awg2|amneziawg) deploy_one "$p" "$port_awg" "" ;;
+      xray|vless|reality) deploy_one "$p" "$port_xray" "$site" ;;
+      wireguard|wg) deploy_one "$p" "$port_wg" "" ;;
+      *) deploy_one "$p" "" "" ;;
+    esac
+  done
+  finish_run
+  log "Дальше: в приложении Amnezia добавь этот сервер (IP, логин и пароль или ключ SSH)."
+  log "Приложение найдёт установленные протоколы само, и пользователями можно управлять как обычно."
+  (( ${#ERRORS[@]} == 0 ))
+}
+
+cmd_backups() {
+  [[ -d $BACKUP_ROOT ]] || { echo "резервных копий нет"; return 0; }
+  find "$BACKUP_ROOT" -mindepth 2 -maxdepth 2 -type d -printf '%P\n' 2>/dev/null | sort -r
+}
+
+cmd_restore() {
+  local c=${1:-} stamp=${2:-} dir
+  [[ -n $c ]] || die "укажи контейнер: $PROG restore amnezia-awg2 [ДАТА]"
+  has_state "$c" || die "у $c нет ключей и пользователей, восстанавливать нечего"
+  need_root
+  init_work
+  acquire_lock
+  start_logging
+  if [[ -z $stamp ]]; then
+    stamp=$(find "$BACKUP_ROOT" -mindepth 2 -maxdepth 2 -type d -name "$c" -printf '%P\n' 2>/dev/null | sort -r | head -1 | cut -d/ -f1)
+  fi
+  dir="$BACKUP_ROOT/$stamp/$c/opt-amnezia"
+  [[ -n $stamp && -d $dir ]] || die "нет резервной копии $c ${stamp}"
+  c_exists "$c" || die "контейнера $c нет"
+  log "$c: возвращаю /opt/amnezia из копии $stamp"
+  docker cp "$dir/." "$c:/opt/amnezia/" >/dev/null || die "не смог скопировать в контейнер"
+  docker restart -t 5 "$c" >/dev/null
+  extract_vars "$c" "$dir" >/dev/null 2>&1
+  EXPECT_PUBKEY=""
+  EXPECT_PEERS=""
+  if health_check "$c"; then change "$c: восстановлен из копии $stamp"; else fail "$c: после восстановления проверка не прошла"; fi
+  (( ${#ERRORS[@]} == 0 ))
+}
+
+usage() {
+  cat <<EOF
+$PROG $VERSION: автообновление ОС и контейнеров Amnezia VPN
+
+Установка на сервер (один раз, от root или через sudo):
+  bash $PROG install [--time 04:00] [--tz Europe/Moscow] [--reboot if-needed|never]
+                     [--telegram-token ТОКЕН --telegram-chat ID] [--name ИМЯ]
+                     [--deploy awg,xray] [--import ФАЙЛ] [--update-now]
+
+Команды:
+  run [--no-os] [--no-containers] [--no-reboot] [--force] [--only ИМЯ]
+        полный цикл: ОС, контейнеры, настройки хоста, перезагрузка при необходимости
+        (так запускается ежедневный таймер)
+  check                 показать, что будет обновлено, ничего не меняя
+  status                расписание, последний запуск, контейнеры, место на диске
+  update-containers [--force] [--only ИМЯ]
+                        только контейнеры Amnezia
+  update-os             только пакеты ОС (без перезагрузки)
+  deploy [awg,xray,wireguard,dns] [--awg-port N] [--xray-port N] [--xray-site ДОМЕН]
+                        развернуть протоколы на сервере по скриптам приложения Amnezia
+  host-setup            заново применить сетевые настройки хоста (запускается при загрузке)
+  export [ФАЙЛ|-]       сохранить ключи и базу пользователей всех контейнеров в архив
+  import ФАЙЛ           поднять те же контейнеры на этом сервере из архива export
+  backups               список резервных копий /opt/amnezia
+  restore ИМЯ [ДАТА]    вернуть ключи и клиентов контейнера из резервной копии
+  self-update           скачать новую версию скрипта (SELF_UPDATE_URL в настройках)
+  uninstall [--purge]   убрать таймер (контейнеры не трогаются)
+  version               версия
+
+Настройки: $CONF_FILE, журнал: $LOG_FILE (или journalctl -u amnezia-autoupdate)
+EOF
+}
+
+main() {
+  local cmd=${1:-help}
+  shift || true
+  load_config
+  case $cmd in
+    run) cmd_run "$@" ;;
+    check) cmd_check "$@" ;;
+    status) cmd_status "$@" ;;
+    update-containers) cmd_update_containers "$@" ;;
+    update-os) cmd_update_os "$@" ;;
+    deploy) cmd_deploy "$@" ;;
+    export) cmd_export "$@" ;;
+    install) cmd_install "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    self-update) cmd_self_update "$@" ;;
+    import) cmd_import "$@" ;;
+    host-setup) cmd_host_setup "$@" ;;
+    backups) cmd_backups "$@" ;;
+    restore) cmd_restore "$@" ;;
+    version|--version|-v) echo "$PROG $VERSION" ;;
+    help|--help|-h) usage ;;
+    *) usage; exit 2 ;;
+  esac
+}
+
+main "$@"

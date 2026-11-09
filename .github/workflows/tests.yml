@@ -1,0 +1,35 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # каждый день: проверка на последнем релизе приложения Amnezia
+    - cron: "17 3 * * *"
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: bash -n и shellcheck
+        run: |
+          bash -n amnezia-autoupdate
+          shellcheck -s bash amnezia-autoupdate tests/*.sh
+
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - name: Серверные скрипты последнего релиза Amnezia
+        run: |
+          url=$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/amnezia-vpn/amnezia-client/releases/latest)
+          tag=${url##*/tag/}
+          echo "Amnezia release: $tag"
+          git clone --depth 1 --branch "$tag" https://github.com/amnezia-vpn/amnezia-client "$RUNNER_TEMP/amnezia-client"
+      - name: Развёртывание, обновление, откат, экспорт и импорт
+        run: sudo bash tests/e2e.sh "$RUNNER_TEMP/amnezia-client/client/server_scripts"
+      - name: Установка, настройки, таймер, удаление
+        run: sudo bash tests/install.sh
