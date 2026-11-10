@@ -18,7 +18,7 @@ set -uo pipefail
 umask 077
 export LC_ALL=C
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 PROG="amnezia-autoupdate"
 
 CONF_FILE="${AAU_CONF:-/etc/amnezia-autoupdate.conf}"
@@ -39,6 +39,7 @@ REBOOT="if-needed"           # if-needed | never | always
 FORCE_REBUILD_DAYS="0"       # пересобирать контейнер раз в N дней, даже если ничего не изменилось (0 = нет)
 KEEP_BACKUPS="10"            # сколько последних резервных копий /opt/amnezia хранить для каждого контейнера
 MIN_FREE_MB="1500"           # минимум свободного места для сборки образа
+LOG_MAX_MB="10"              # журнал циклический: сверх этого размера (МБ) старые записи отрезаются, 0 = без ограничения
 HEALTH_TIMEOUT="60"          # сколько секунд ждать, пока новый контейнер заработает
 NOTIFY="changes"             # changes | errors | always | never (уведомления в Telegram)
 TELEGRAM_BOT_TOKEN=""
@@ -56,6 +57,14 @@ declare -A FOLDER_OF=(
   [amnezia-dns]=dns
 )
 UPDATE_ORDER=(amnezia-awg2 amnezia-awg amnezia-wireguard amnezia-xray amnezia-dns)
+# Чем узнать версии программ в контейнере (для журнала): "программа:аргумент"
+declare -A VERSION_PROBES=(
+  [amnezia-awg2]="amneziawg-go:--version awg:--version"
+  [amnezia-awg]="wireguard-go:--version wg:--version"
+  [amnezia-wireguard]="wg:--version"
+  [amnezia-xray]="xray:version"
+  [amnezia-dns]="unbound:-V"
+)
 SHARED_SCRIPTS=(install_docker.sh prepare_host.sh build_container.sh setup_host_firewall.sh update_server_packages.sh)
 FOLDER_SCRIPTS=(Dockerfile run_container.sh configure_container.sh start.sh template.conf)
 
@@ -99,6 +108,16 @@ fail()   { printf '%s ОШИБКА: %s\n' "$(ts)" "$*"; ERRORS+=("$*"); }
 change() { printf '%s %s\n' "$(ts)" "$*"; CHANGES+=("$*"); }
 die()    { printf '%s ОШИБКА: %s\n' "$(ts)" "$*" >&2; exit 1; }
 
+# Таймер запускает нас через systemd напрямую: родитель PID 1 и задан INVOCATION_ID
+run_trigger() { if [[ -n ${INVOCATION_ID:-} && $PPID == 1 ]]; then printf 'по расписанию'; else printf 'вручную'; fi; }
+# Сколько идёт запуск: "41 с" или "3 мин 5 с"
+elapsed() { if (( SECONDS < 60 )); then printf '%s с' "$SECONDS"; else printf '%s мин %s с' $((SECONDS / 60)) $((SECONDS % 60)); fi; }
+os_info() {
+  local name
+  name=$(sed -nE 's/^PRETTY_NAME="?([^"]*)"?$/\1/p' /etc/os-release 2>/dev/null)
+  printf '%s, ядро %s' "${name:-ОС неизвестна}" "$(uname -r)"
+}
+
 server_label() {
   if [[ -n $SERVER_NAME ]]; then printf '%s' "$SERVER_NAME"; else hostname -f 2>/dev/null || hostname; fi
 }
@@ -123,6 +142,7 @@ load_config() {
   fi
   [[ $KEEP_BACKUPS =~ ^[0-9]+$ ]] || KEEP_BACKUPS=10
   [[ $MIN_FREE_MB =~ ^[0-9]+$ ]] || MIN_FREE_MB=1500
+  [[ $LOG_MAX_MB =~ ^[0-9]+$ ]] || LOG_MAX_MB=10
   [[ $HEALTH_TIMEOUT =~ ^[0-9]+$ ]] || HEALTH_TIMEOUT=60
   [[ $FORCE_REBUILD_DAYS =~ ^[0-9]+$ ]] || FORCE_REBUILD_DAYS=0
 }
@@ -166,7 +186,21 @@ acquire_lock() {
 
 start_logging() {
   mkdir -p "$(dirname "$LOG_FILE")"
+  trim_log
   exec > >(tee -a "$LOG_FILE") 2>&1
+}
+
+# Журнал циклический: когда он больше LOG_MAX_MB, самые старые записи отрезаются
+# и остаются последние три четверти. До версии 1.1.0 журнал раз в неделю
+# ротировал logrotate, это правило больше не нужно.
+trim_log() {
+  local max size
+  rm -f /etc/logrotate.d/amnezia-autoupdate
+  max=$((LOG_MAX_MB * 1024 * 1024))
+  (( max > 0 )) || return 0
+  size=$(stat -c %s "$LOG_FILE" 2>/dev/null) || return 0
+  (( size > max )) || return 0
+  tail -c $((max * 3 / 4)) "$LOG_FILE" | sed '1d' > "$LOG_FILE.tmp" && mv -f "$LOG_FILE.tmp" "$LOG_FILE"
 }
 
 have_docker() { command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; }
@@ -273,6 +307,7 @@ prepare_upstream() {
   if [[ $tag != local && -f $dir/.complete ]]; then
     UP=$dir; UP_TAG=$tag
     ln -sfn "$dir" "$STATE_DIR/upstream/current"
+    log "серверные скрипты Amnezia: релиз $UP_TAG"
     return 0
   fi
   mkdir -p "$STATE_DIR/upstream"
@@ -372,6 +407,16 @@ dockerfile_bases() {
 c_exists()  { docker container inspect "$1" >/dev/null 2>&1; }
 c_running() { [[ $(docker container inspect -f '{{.State.Running}}' "$1" 2>/dev/null) == true ]]; }
 c_image()   { docker container inspect -f '{{.Image}}' "$1" 2>/dev/null; }
+# Версии программ в работающем контейнере, например "xray 26.10.31"
+c_versions() {
+  local c=$1 probe bin v out=""
+  for probe in ${VERSION_PROBES[$c]:-}; do
+    bin=${probe%%:*}
+    v=$(timeout 10 docker exec "$c" "$bin" "${probe#*:}" 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -n1)
+    [[ -n $v ]] && out+="${out:+, }$bin $v"
+  done
+  printf '%s' "$out"
+}
 c_restart_policy() { docker container inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$1" 2>/dev/null; }
 img_layers() { docker image inspect -f '{{range .RootFS.Layers}}{{println .}}{{end}}' "$1" 2>/dev/null; }
 
@@ -718,18 +763,19 @@ save_container_state() {
 
 update_container() {
   local c=$1 up="$UP/${FOLDER_OF[$1]}" prev="$1-aau-prev" new="$1:aau-new"
-  local stamp bk old_img policy extra=""
+  local stamp bk old_img policy extra="" old_vers new_vers
 
   recover_leftovers "$c" || return 1
   if ! c_running "$c"; then
     log "$c: контейнер остановлен, пропускаю"
     return 0
   fi
+  old_vers=$(c_versions "$c")
   if ! needs_update "$c"; then
-    log "$c: актуален (релиз $UP_TAG)"
+    log "$c: актуален (${old_vers:+$old_vers, }релиз Amnezia $UP_TAG)"
     return 0
   fi
-  log "$c: нужно обновление: $REASON"
+  log "$c: нужно обновление: $REASON${old_vers:+ (сейчас: $old_vers)}"
   (( DRY_RUN )) && return 0
 
   if ! ensure_free_space "$(docker_root)"; then
@@ -833,8 +879,14 @@ update_container() {
   save_container_state "$c"
   docker image prune -f >/dev/null 2>&1
   docker builder prune -af >/dev/null 2>&1
-  [[ -n $EXPECT_PEERS ]] && extra=", клиентов: $EXPECT_PEERS"
-  change "$c обновлён до релиза $UP_TAG ($REASON)$extra"
+  new_vers=$(c_versions "$c")
+  if [[ $new_vers != "$old_vers" ]]; then
+    extra="; было: ${old_vers:-?}; стало: ${new_vers:-?}"
+  elif [[ -n $new_vers ]]; then
+    extra="; версии те же: $new_vers"
+  fi
+  [[ -n $EXPECT_PEERS ]] && extra+="; клиентов: $EXPECT_PEERS"
+  change "$c обновлён до релиза Amnezia $UP_TAG ($REASON)$extra"
   return 0
 }
 
@@ -1368,6 +1420,9 @@ FORCE_REBUILD_DAYS="0"
 KEEP_BACKUPS="10"
 # Если свободно меньше (МБ), сначала чистим кэш; без места образ не собираем
 MIN_FREE_MB="1500"
+# Журнал /var/log/amnezia-autoupdate.log циклический: когда он больше LOG_MAX_MB (МБ),
+# самые старые записи отрезаются (0 = не ограничивать)
+LOG_MAX_MB="10"
 
 # Уведомления в Telegram (необязательно): токен бота от @BotFather и id чата
 TELEGRAM_BOT_TOKEN=""
@@ -1541,18 +1596,9 @@ cmd_install() {
     systemctl restart systemd-journald >/dev/null 2>&1
     log "системный журнал ограничен до $journal_max (диск небольшой)"
   fi
-  if [[ -d /etc/logrotate.d ]]; then
-    cat > /etc/logrotate.d/amnezia-autoupdate <<EOF
-$LOG_FILE {
-  weekly
-  rotate 4
-  maxsize 5M
-  compress
-  missingok
-  notifempty
-}
-EOF
-    chmod 644 /etc/logrotate.d/amnezia-autoupdate
+  rm -f /etc/logrotate.d/amnezia-autoupdate   # журнал теперь циклический сам (LOG_MAX_MB)
+  if (( LOG_MAX_MB > 0 )); then
+    log "журнал: $LOG_FILE, циклический, до $LOG_MAX_MB МБ"
   fi
   log "установка завершена"
 
@@ -1625,7 +1671,11 @@ finish_run() {
     changes) (( ${#ERRORS[@]} + ${#CHANGES[@]} > 0 )) && notify "$text" ;;
     errors) (( ${#ERRORS[@]} > 0 )) && notify "$text" ;;
   esac
-  log "итог: $result"
+  local what="всё актуально, обновлять нечего"
+  (( ${#CHANGES[@]} > 0 )) && what="изменений: ${#CHANGES[@]}"
+  (( ${#ERRORS[@]} > 0 )) && what="ошибок: ${#ERRORS[@]}, изменений: ${#CHANGES[@]}"
+  (( ${#WARNINGS[@]} > 0 )) && what+=", предупреждений: ${#WARNINGS[@]}"
+  log "=== итог: $result, $what, заняло $(elapsed) ==="
 }
 
 cmd_run() {
@@ -1645,7 +1695,8 @@ cmd_run() {
   init_work
   acquire_lock
   start_logging
-  log "=== $PROG $VERSION: запуск на $(server_label) ==="
+  log "=== $PROG $VERSION: запуск $(run_trigger) на $(server_label) ==="
+  log "ОС: $(os_info)"
   [[ $do_os == yes ]] && os_update
   [[ $do_containers == yes ]] && update_containers
   host_setup

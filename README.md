@@ -136,7 +136,28 @@ sudo bash amnezia-autoupdate install --import /root/amnezia-export-ИМЯ-ДАТ
 | `sudo amnezia-autoupdate self-update` | скачать новую версию скрипта с GitHub |
 | `sudo amnezia-autoupdate uninstall [--purge]` | убрать таймер (контейнеры не трогаются) |
 
-Журнал: `/var/log/amnezia-autoupdate.log` или `journalctl -u amnezia-autoupdate`.
+### Журнал
+
+Журнал: `/var/log/amnezia-autoupdate.log` или `journalctl -u amnezia-autoupdate`. Он циклический:
+когда файл больше 10 МБ (`LOG_MAX_MB`), самые старые записи отрезаются. Так выглядит ночь,
+когда обновлять нечего:
+
+```text
+2026-11-11 04:17:32 === amnezia-autoupdate 1.1.0: запуск по расписанию на vps1 ===
+2026-11-11 04:17:32 ОС: Ubuntu 24.04.3 LTS, ядро 6.8.0-87-generic
+2026-11-11 04:17:32 обновляю пакеты ОС
+2026-11-11 04:17:58 ОС: обновлений нет
+2026-11-11 04:17:59 серверные скрипты Amnezia: релиз 5.1.0.6
+2026-11-11 04:18:00 amnezia-awg2: актуален (amneziawg-go 0.0.20250522, awg 3.1.20260812, релиз Amnezia 5.1.0.6)
+2026-11-11 04:18:00 amnezia-xray: актуален (xray 26.10.31, релиз Amnezia 5.1.0.6)
+2026-11-11 04:18:01 сетевые настройки хоста применены (setup_host_firewall.sh, лог: /var/lib/amnezia-autoupdate/host-setup.log)
+2026-11-11 04:18:01 === итог: ok, всё актуально, обновлять нечего, заняло 29 с ===
+```
+
+Если обновление есть, вместо «актуален» будет причина («нужно обновление: новый Dockerfile» или
+«новый базовый образ»), шаги сборки и замены контейнера и строка с версиями до и после, например
+`amnezia-xray обновлён до релиза Amnezia 5.1.1.0 (новый Dockerfile); было: xray 26.10.31; стало: xray 26.11.20; клиентов: 2`.
+Для ОС пишется, сколько пакетов обновлено, и какие именно. Итог: `=== итог: ok, изменений: 1, заняло 58 с ===`.
 
 ## Настройки
 
@@ -146,6 +167,7 @@ sudo bash amnezia-autoupdate install --import /root/amnezia-export-ИМЯ-ДАТ
 * `REBOOT`: `if-needed`, `never` или `always`.
 * `UPSTREAM_REF`: `latest` или конкретный релиз приложения, например `5.1.0.6`.
 * `KEEP_BACKUPS`, `MIN_FREE_MB`: сколько копий хранить и сколько места нужно для сборки.
+* `LOG_MAX_MB`: размер журнала в МБ (по умолчанию 10), сверх него отрезаются самые старые записи.
 * `NOTIFY`: когда писать в Telegram: `changes` (изменения и ошибки), `errors`, `always`, `never`.
 
 После смены времени запуска выполни `sudo amnezia-autoupdate install` ещё раз, чтобы обновить таймер.

@@ -45,6 +45,9 @@ sed 's/^cmd_check() {$/cmd_check() { echo "check: пропущен в тесте
   "$ROOT/amnezia-autoupdate" > "$SRC"
 
 section "1. первая установка"
+# правило logrotate от версии 1.0.0: install его убирает, журнал теперь циклический сам
+mkdir -p /etc/logrotate.d
+printf '/var/log/amnezia-autoupdate.log {\n  weekly\n}\n' > /etc/logrotate.d/amnezia-autoupdate
 run bash "$SRC" install --time 05:30 --tz Europe/Moscow --delay 45min --reboot never \
   --telegram-token '123:ABC$x"y`z\w' --telegram-chat -100500 --name 'srv $HOME "1"' --no-os-update
 check "install завершился без ошибок" [ $? -eq 0 ]
@@ -66,7 +69,9 @@ check "сервис настроек хоста при загрузке" grep -q
 check "systemctl: таймер включён" grep -qx 'enable --now amnezia-autoupdate.timer' "$T/systemctl.log"
 check "systemctl: host-setup включён" grep -qx 'enable amnezia-hostsetup.service' "$T/systemctl.log"
 check "журнал ограничен 200M" grep -qx 'SystemMaxUse=200M' /etc/systemd/journald.conf.d/60-amnezia-autoupdate.conf
-check "logrotate настроен" [ -f /etc/logrotate.d/amnezia-autoupdate ]
+check "старое правило logrotate убрано" [ ! -e /etc/logrotate.d/amnezia-autoupdate ]
+check "install пишет про циклический журнал" out_has "циклический, до 10 МБ"
+check "LOG_MAX_MB=10 в настройках" [ "$(conf_val LOG_MAX_MB)" == 10 ]
 if command -v systemd-analyze >/dev/null 2>&1; then
   systemd-analyze verify "$UNITS/amnezia-autoupdate.service" "$UNITS/amnezia-autoupdate.timer" \
     "$UNITS/amnezia-hostsetup.service" > "$T/verify.log" 2>&1

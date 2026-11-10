@@ -29,6 +29,7 @@ export AAU_LOCK_FILE=$T/lock
 AAU=(bash "$ROOT/amnezia-autoupdate")
 REG=localhost:5000/aau-test
 XRAY_RELEASE=$(sed -n 's/^ARG XRAY_RELEASE="\(.*\)"/\1/p' "$SRC/xray/Dockerfile")
+XRAY_VERSION=${XRAY_RELEASE#v}
 
 PASS=0
 FAILED=0
@@ -337,9 +338,33 @@ check "status показывает контейнеры" out_has "amnezia-awg2: 
 
 # ---------------------------------------------------------------- 12. ночной запуск
 section "12. run: то, что каждую ночь запускает таймер (без ОС и перезагрузки)"
+# старые записи на 3 МБ при LOG_MAX_MB=1: журнал должен обрезаться с начала
+printf 'LOG_MAX_MB="1"\n' >> "$AAU_CONF"
+seq 1 60000 | sed 's/^/2026-01-01 00:00:00 старая запись журнала номер /' >> "$AAU_LOG_FILE"
 run_aau run --no-os --no-reboot
 check "run завершился без ошибок" [ $? -eq 0 ]
 check "контейнеры актуальны" out_has "amnezia-awg2: актуален"
+check "в журнале как запущен" out_has "запуск вручную на"
+check "в журнале ОС и ядро" out_has "ОС: .*, ядро $(uname -r)"
+check "в журнале релиз Amnezia" out_has "серверные скрипты Amnezia: релиз"
+check "в журнале версия AmneziaWG" out_has "amnezia-awg2: актуален (amneziawg-go [0-9.]*, awg [0-9.]*, релиз Amnezia"
+check "в журнале версия XRay" out_has "amnezia-xray: актуален (xray $XRAY_VERSION, релиз Amnezia"
+check "в журнале версия unbound" out_has "amnezia-dns: актуален (unbound [0-9.]*, релиз Amnezia"
+check "в журнале итог: обновлять нечего" out_has "=== итог: ok, всё актуально, обновлять нечего, заняло"
+check "журнал обрезан до LOG_MAX_MB=1" [ "$(stat -c %s "$AAU_LOG_FILE")" -le $((1024 * 1024)) ]
+check "в конце журнала этот запуск" bash -c 'tail -n 1 "$1" | grep -q "=== итог: ok"' _ "$AAU_LOG_FILE"
+check "журнал начинается с целой строки" bash -c 'head -n 1 "$1" | grep -qE "^2026-01-01 00:00:00 старая запись журнала номер [0-9]+$"' _ "$AAU_LOG_FILE"
+# Запуск так же, как его делает таймер: отдельным сервисом systemd (на машинах с systemd, например в CI)
+if [[ -d /run/systemd/system ]] && command -v systemd-run >/dev/null 2>&1; then
+  systemd-run --quiet --wait --pipe --collect \
+    -E AAU_CONF="$AAU_CONF" -E AAU_STATE_DIR="$AAU_STATE_DIR" -E AAU_BACKUP_DIR="$AAU_BACKUP_DIR" \
+    -E AAU_LOG_FILE="$AAU_LOG_FILE" -E AAU_LOCK_FILE="$AAU_LOCK_FILE" \
+    "$(command -v bash)" "$ROOT/amnezia-autoupdate" run --no-os --no-reboot > "$T/last.out" 2>&1
+  rc=$?
+  sed 's/^/    | /' "$T/last.out"
+  check "через systemd: run без ошибок" [ $rc -eq 0 ]
+  check "через systemd: в журнале запуск по расписанию" out_has "запуск по расписанию на"
+fi
 check "настройки хоста применены" out_has "сетевые настройки хоста применены"
 check "итог ok записан" grep -q '^RESULT=ok' "$AAU_STATE_DIR/last-run"
 check "после ночного запуска тот же ключ AmneziaWG" [ "$(awg_pub)" == "$S_AWG_PUB" ]
