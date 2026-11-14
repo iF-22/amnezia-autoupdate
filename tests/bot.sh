@@ -164,9 +164,12 @@ check "ответ на /status тот же, что у команды status" dif
 # ---------------------------------------------------------------- 4. перезапуск
 section "4. после перезапуска второй раз не отвечает"
 n=$(sent)
+# Telegram отвечает на sendMessage с задержкой: бота перезапускают, пока он ещё отвечает
+curl -fsS -o /dev/null "$API/test/slow?send=2"
 say 777 /status
 check "ответил на /status" wait_sent $((n + 1))
 restart_bot srv1
+curl -fsS -o /dev/null "$API/test/slow?send=0"
 check "бот перезапущен" wait_log srv1 "жду команды" 10
 check "на уже отвеченный /status второй раз не ответил" quiet_for 3
 check "в состоянии бота последний update_id" grep -q '^LAST_ID=[0-9]' "$T/srv1/state/bot.state"

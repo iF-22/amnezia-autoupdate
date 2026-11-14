@@ -2149,6 +2149,11 @@ bot_process() {   # bot_process ФАЙЛ
       [[ $date =~ ^[0-9]+$ ]] && (( now - date > BOT_MAX_AGE )) && continue
       [[ -n $BOT_LAST_ID ]] && (( id <= BOT_LAST_ID )) && continue
     fi
+    # запоминаем сообщение до ответа: если службу перезапустят, пока бот отвечает,
+    # Telegram отдаст это сообщение снова, а второго ответа не будет
+    BOT_LAST_ID=$id
+    BOT_LAST_AT=$now
+    bot_save_state
     bot_command "$text" < /dev/null
   done < <(jq -r '.result[]? | [(.update_id | tostring), (.message.chat.id // "" | tostring),
                    (.message.date // 0 | tostring), ((.message.text // "") | gsub("[\u001f\r\n]"; " "))]

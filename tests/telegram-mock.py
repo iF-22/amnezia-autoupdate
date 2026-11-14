@@ -9,6 +9,7 @@
 
 Входящее сообщение для бота: POST /test/message с chat_id, text и age (сколько секунд
 назад оно отправлено). POST /test/webhook?on=1 включает webhook (getUpdates тогда даёт 409).
+POST /test/slow?send=СЕКУНД: sendMessage отвечает с такой задержкой (сообщение уже записано).
 
 getUpdates ведёт себя как у Telegram: offset > 0 подтверждает (удаляет) сообщения до него,
 offset < 0 оставляет только последние, запрос с timeout ждёт новых сообщений, а новый
@@ -27,7 +28,7 @@ os.makedirs(DIR, exist_ok=True)
 
 cond = threading.Condition()
 files_lock = threading.Lock()
-st = {'updates': [], 'next_update': 1000, 'next_msg': 1, 'gen': 0, 'webhook': False}
+st = {'updates': [], 'next_update': 1000, 'next_msg': 1, 'gen': 0, 'webhook': False, 'send_delay': 0.0}
 
 CONFLICT = 'Conflict: terminated by other getUpdates request; make sure that only one bot instance is running'
 WEBHOOK = "Conflict: can't use getUpdates method while webhook is active; use deleteWebhook to delete the webhook first"
@@ -104,6 +105,7 @@ def api(method, p):
         record('sent.jsonl', {'chat_id': chat, 'text': text, 't': time.time()})
         with cond:
             st['next_msg'] += 1
+        time.sleep(st['send_delay'])
         return 200, {'ok': True, 'result': {'message_id': st['next_msg'], 'text': text}}
     if method == 'setMyCommands':
         json.loads(p.get('commands', ''))
@@ -144,6 +146,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(*add_message(p))
         if path == '/test/webhook':
             st['webhook'] = p.get('on') == '1'
+            return self.reply(200, {'ok': True})
+        if path == '/test/slow':
+            st['send_delay'] = float(p.get('send') or 0)
             return self.reply(200, {'ok': True})
         parts = path.split('/')
         if len(parts) != 3 or not parts[1].startswith('bot'):
