@@ -28,16 +28,28 @@ run() { "$@" > "$T/last.out" 2>&1; local rc=$?; sed 's/^/    | /' "$T/last.out";
 out_has() { grep -q -- "$1" "$T/last.out"; }
 conf_val() { (set +u; . "$CONF"; eval "printf '%s' \"\${$1}\""); }
 
-# Заглушки: systemctl записывает вызовы, check и run не нужны (их проверяет e2e.sh)
+# Заглушки: systemctl записывает вызовы (следующий запуск таймера через 5 ч 7 мин),
+# check и run не нужны (их проверяет e2e.sh)
 mkdir -p "$T/bin"
 cat > "$T/bin/systemctl" <<EOF
 #!/bin/sh
 echo "\$*" >> "$T/systemctl.log"
-case "\$1" in list-timers) echo "Mon 2026-11-10 04:12:00 MSK 19h left - - amnezia-autoupdate.timer amnezia-autoupdate.service" ;; esac
+case "\$*" in "show --timestamp=unix -p NextElapseUSecRealtime"*) echo "@\$((\$(date +%s) + 18420))" ;; esac
 exit 0
 EOF
 chmod 755 "$T/bin/systemctl"
 export PATH="$T/bin:$PATH"
+
+# Заглушка Telegram: install проверяет токен и пишет в чат
+python3 "$ROOT/tests/telegram-mock.py" "$T/tg" 42:TEST 777 > "$T/mock.log" 2>&1 &
+MOCK=$!
+trap 'kill $MOCK 2>/dev/null' EXIT
+for _ in $(seq 50); do [[ -s $T/tg/port ]] && break; sleep 0.1; done
+AAU_TELEGRAM_API="http://127.0.0.1:$(cat "$T/tg/port")"
+export AAU_TELEGRAM_API
+touch "$T/tg/sent.jsonl"
+sent() { wc -l < "$T/tg/sent.jsonl"; }
+last_sent() { tail -n 1 "$T/tg/sent.jsonl" | jq -r "$1"; }
 
 # Копия скрипта, в которой check ничего не делает (без Docker и сети)
 SRC="$T/amnezia-autoupdate"
@@ -72,9 +84,14 @@ check "журнал ограничен 200M" grep -qx 'SystemMaxUse=200M' /etc/s
 check "старое правило logrotate убрано" [ ! -e /etc/logrotate.d/amnezia-autoupdate ]
 check "install пишет про циклический журнал" out_has "циклический, до 10 МБ"
 check "LOG_MAX_MB=10 в настройках" [ "$(conf_val LOG_MAX_MB)" == 10 ]
+check "TELEGRAM_COMMANDS=yes в настройках" [ "$(conf_val TELEGRAM_COMMANDS)" == yes ]
+check "служба бота создана (токен и числовой id чата заданы)" grep -qx "ExecStart=$BIN bot" "$UNITS/amnezia-autoupdate-bot.service"
+check "служба бота ограничена (только чтение системы, память)" bash -c 'grep -qx ProtectSystem=full "$1" && grep -qx NoNewPrivileges=yes "$1" && grep -qx MemoryMax=128M "$1"' _ "$UNITS/amnezia-autoupdate-bot.service"
+check "systemctl: бот включён и перезапущен" bash -c 'grep -qx "enable amnezia-autoupdate-bot.service" "$1" && grep -qx "restart amnezia-autoupdate-bot.service" "$1"' _ "$T/systemctl.log"
+check "неверный токен: install предупреждает, но не падает" out_has "ВНИМАНИЕ: .*Telegram"
 if command -v systemd-analyze >/dev/null 2>&1; then
   systemd-analyze verify "$UNITS/amnezia-autoupdate.service" "$UNITS/amnezia-autoupdate.timer" \
-    "$UNITS/amnezia-hostsetup.service" > "$T/verify.log" 2>&1
+    "$UNITS/amnezia-hostsetup.service" "$UNITS/amnezia-autoupdate-bot.service" > "$T/verify.log" 2>&1
   check "systemd-analyze verify без ошибок про наши юниты" bash -c "! grep -i amnezia '$T/verify.log' | grep -viE 'not found|No such|bus|Failed to (connect|create)' | grep -q ."
   sed 's/^/    | /' "$T/verify.log"
   check "systemd понимает расписание" systemd-analyze calendar '*-*-* 05:30:00 Europe/Moscow'
@@ -108,21 +125,53 @@ chown root "$CONF"
 
 section "4. status и self-update"
 run "$BIN" status
-check "status показывает таймер" out_has "Следующий запуск: Mon 2026-11-10"
+check "status: следующий запуск по Москве и сколько ждать" out_has "^Следующий запуск: 20[0-9-]* [0-9][0-9]:[0-9][0-9] MSK (через 5 ч [0-9]* мин)$"
+check "status: последний запуск" out_has "^Последний запуск: ещё не было"
+check "status: место на диске" out_has "^Свободно на диске: [0-9]* МБ"
 sed 's/^VERSION="[^"]*"/VERSION="9.9.9"/' "$ROOT/amnezia-autoupdate" > "$T/new-version"
 echo "SELF_UPDATE_URL=\"file://$T/new-version\"" >> "$CONF"
+: > "$T/systemctl.log"
 run "$BIN" self-update
 check "self-update без ошибок" [ $? -eq 0 ]
 check "версия теперь 9.9.9" bash -c "'$BIN' version | grep -q 9.9.9"
+check "self-update перезапустил бота на новой версии" grep -qx "try-restart amnezia-autoupdate-bot.service" "$T/systemctl.log"
 printf 'echo hacked\n' > "$T/not-a-script"
 sed -i "s|^SELF_UPDATE_URL=.*|SELF_UPDATE_URL=\"file://$T/not-a-script\"|" "$CONF"
 run "$BIN" self-update
 check "чужой файл не ставится" [ $? -ne 0 ]
 check "версия осталась 9.9.9" bash -c "'$BIN' version | grep -q 9.9.9"
 
-section "5. удаление"
+section "5. бот Telegram"
+n=$(sent)
+run bash "$SRC" install --telegram-token 42:TEST --telegram-chat 777
+check "install с верным ботом без ошибок" [ $? -eq 0 ]
+check "бот прислал проверочное сообщение" [ "$(sent)" -eq $((n + 1)) ]
+check "сообщение в чат 777" [ "$(last_sent .chat_id)" == 777 ]
+check "в сообщении имя сервера и что бот подключён" bash -c '[[ $(tail -n 1 "$1" | jq -r .text) == "[srv \$HOME \"1\"] amnezia-autoupdate "*" подключён к этому чату."* ]]' _ "$T/tg/sent.jsonl"
+check "в сообщении сказано, когда приходят отчёты" bash -c 'tail -n 1 "$1" | jq -r .text | grep -q "Если обновлять нечего, отчёта не будет"' _ "$T/tg/sent.jsonl"
+check "в сообщении команда /status" bash -c 'tail -n 1 "$1" | jq -r .text | grep -q "/status"' _ "$T/tg/sent.jsonl"
+check "install пишет, что сообщение отправлено" out_has "бот @aau_test_bot прислал проверочное сообщение в чат 777"
+check "install пишет, где журнал бота" out_has "journalctl -u amnezia-autoupdate-bot"
+run bash "$SRC" install --telegram-chat 555
+check "неверный чат: install не падает" [ $? -eq 0 ]
+check "неверный чат: понятное предупреждение" out_has "не смог написать в чат 555 (400 Bad Request: chat not found)"
+: > "$T/systemctl.log"
+n=$(sent)
+run bash "$SRC" install --telegram-chat 777 --telegram-commands no
+check "--telegram-commands no сохранено" [ "$(conf_val TELEGRAM_COMMANDS)" == no ]
+check "--telegram-commands no: служба бота удалена" [ ! -e "$UNITS/amnezia-autoupdate-bot.service" ]
+check "--telegram-commands no: бот остановлен" grep -qx "disable --now amnezia-autoupdate-bot.service" "$T/systemctl.log"
+check "--telegram-commands no: отчёты остаются, про /status не пишет" bash -c '[ "$(wc -l < "$1")" -eq "$2" ] && ! tail -n 1 "$1" | jq -r .text | grep -q /status' _ "$T/tg/sent.jsonl" $((n + 1))
+run bash "$SRC" install --telegram-commands maybe
+check "--telegram-commands maybe отклонено" [ $? -ne 0 ]
+run bash "$SRC" install --telegram-commands yes
+check "--telegram-commands yes: служба бота снова есть" [ -f "$UNITS/amnezia-autoupdate-bot.service" ]
+
+section "6. удаление"
+: > "$T/systemctl.log"
 run "$BIN" uninstall
 check "uninstall без ошибок" [ $? -eq 0 ]
+check "uninstall остановил бота" grep -qx "disable --now amnezia-autoupdate-bot.service" "$T/systemctl.log"
 check "юниты удалены" bash -c "! ls $UNITS/amnezia-* 2>/dev/null | grep -q ."
 check "скрипт удалён" [ ! -e "$BIN" ]
 check "настройки оставлены" [ -f "$CONF" ]

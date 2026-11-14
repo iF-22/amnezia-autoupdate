@@ -335,11 +335,72 @@ check "у каждого контейнера не больше KEEP_BACKUPS=3 �
 check "копии awg2 не вытеснены копиями других контейнеров" [ "$(find "$AAU_BACKUP_DIR" -mindepth 2 -maxdepth 2 -type d -name amnezia-awg2 | wc -l)" -eq 3 ]
 run_aau status
 check "status показывает контейнеры" out_has "amnezia-awg2: работает"
+check "status: клиенты AmneziaWG (никто не подключён)" out_has "^  amnezia-awg2: работает, клиентов: 3, на связи: 0$"
+check "status: клиенты XRay" out_has "^  amnezia-xray: работает, клиентов: 2$"
+check "status: клиенты WireGuard" out_has "^  amnezia-wireguard: работает, клиентов: 1, на связи: 0$"
+check "status: версии и откуда контейнер (импорт из шага 9)" out_has "^    amneziawg-go [0-9.]*, awg [0-9.]*; импортирован 20.* (релиз local)$"
+check "status: итог последнего запуска" out_has "^Последний запуск: 20.*, итог: ok$"
+
+# ---------------------------------------------------------------- 11b. бот Telegram
+section "11b. бот Telegram: /status с настоящими контейнерами (заглушка Bot API)"
+python3 "$ROOT/tests/telegram-mock.py" "$T/tg" 42:TEST 777 > "$T/tg-mock.log" 2>&1 &
+MOCK=$!
+trap 'declare -F bot_stop >/dev/null && bot_stop; kill $MOCK 2>/dev/null' EXIT
+for _ in $(seq 50); do [[ -s $T/tg/port ]] && break; sleep 0.1; done
+AAU_TELEGRAM_API="http://127.0.0.1:$(cat "$T/tg/port")"
+export AAU_TELEGRAM_API
+touch "$T/tg/sent.jsonl"
+# Служба бота видит свой /tmp (PrivateTmp), поэтому настройки и состояние бота не в $T
+BOTDIR=/var/lib/aau-e2e-bot
+rm -rf "$BOTDIR"
+mkdir -p "$BOTDIR"
+cp -a "$AAU_STATE_DIR" "$BOTDIR/state"
+cp "$AAU_CONF" "$BOTDIR/bot.conf"
+printf 'TELEGRAM_BOT_TOKEN="42:TEST"\nTELEGRAM_CHAT_ID="777"\nSERVER_NAME="e2e"\n' >> "$BOTDIR/bot.conf"
+BOT_ENV=(AAU_CONF="$BOTDIR/bot.conf" AAU_STATE_DIR="$BOTDIR/state" AAU_BACKUP_DIR="$BOTDIR/backups"
+         AAU_LOG_FILE="$BOTDIR/log" AAU_LOCK_FILE="$BOTDIR/lock" AAU_TELEGRAM_API="$AAU_TELEGRAM_API" AAU_BOT_TIMEOUT=5)
+if [[ -d /run/systemd/system ]] && command -v systemd-run >/dev/null 2>&1; then
+  # как служба amnezia-autoupdate-bot: с теми же ограничениями, что пишет write_bot_unit
+  BOT_PROPS=()
+  while IFS= read -r p; do BOT_PROPS+=(-p "$p"); done < <(sed -n '/^write_bot_unit()/,/^EOF/p' "$ROOT/amnezia-autoupdate" \
+    | grep -E '^(NoNewPrivileges|PrivateTmp|ProtectSystem|MemoryMax|Nice)=')
+  check "в write_bot_unit найдены 5 ограничений службы" [ "${#BOT_PROPS[@]}" -eq 10 ]
+  for e in "${BOT_ENV[@]}"; do BOT_PROPS+=(-E "$e"); done
+  systemctl reset-failed aau-e2e-bot.service >/dev/null 2>&1
+  systemd-run --quiet --unit aau-e2e-bot --collect "${BOT_PROPS[@]}" "$(command -v bash)" "$ROOT/amnezia-autoupdate" bot
+  bot_stop() { systemctl stop aau-e2e-bot.service >/dev/null 2>&1; }
+  bot_log() { journalctl -u aau-e2e-bot.service --no-pager -o cat 2>/dev/null; }
+  echo "  бот запущен как служба aau-e2e-bot"
+else
+  env "${BOT_ENV[@]}" bash "$ROOT/amnezia-autoupdate" bot > "$BOTDIR/bot.log" 2>&1 &
+  BOT=$!
+  bot_stop() { kill "$BOT" 2>/dev/null; wait "$BOT" 2>/dev/null; }
+  bot_log() { cat "$BOTDIR/bot.log"; }
+fi
+for _ in $(seq 100); do jq -e 'select(.method == "getUpdates")' "$T/tg/calls.jsonl" >/dev/null 2>&1 && break; sleep 0.1; done
+sleep 0.5
+curl -fsS -o /dev/null "$AAU_TELEGRAM_API/test/message" -d chat_id=777 --data-urlencode text=/status
+for _ in $(seq 300); do [[ -s $T/tg/sent.jsonl ]] && break; sleep 0.1; done
+jq -r .text "$T/tg/sent.jsonl" > "$T/bot-reply.txt"
+sed 's/^/    | /' "$T/bot-reply.txt"
+check "бот ответил на /status" grep -q '^\[e2e\] amnezia-autoupdate ' "$T/bot-reply.txt"
+check "в ответе AmneziaWG и его клиенты" grep -q '^  amnezia-awg2: работает, клиентов: 3, на связи: 0$' "$T/bot-reply.txt"
+check "в ответе XRay" grep -q '^  amnezia-xray: работает, клиентов: 2$' "$T/bot-reply.txt"
+check "в ответе DNS" grep -q '^  amnezia-dns: работает$' "$T/bot-reply.txt"
+for _ in $(seq 30); do bot_log | grep -q "ответил на /status" && break; sleep 0.2; done
+check "журнал бота" bash -c 'grep -q "ответил на /status" <<< "$1"' _ "$(bot_log)"
+check "бот сохранил состояние" grep -q '^LAST_ID=[0-9]' "$BOTDIR/state/bot.state"
+bot_stop
+bot_log | sed 's/^/    | /'
+rm -rf "$BOTDIR"
 
 # ---------------------------------------------------------------- 12. ночной запуск
 section "12. run: то, что каждую ночь запускает таймер (без ОС и перезагрузки)"
 # старые записи на 3 МБ при LOG_MAX_MB=1: журнал должен обрезаться с начала
 printf 'LOG_MAX_MB="1"\n' >> "$AAU_CONF"
+# отчёт после каждого запуска в заглушку Telegram
+printf 'TELEGRAM_BOT_TOKEN="42:TEST"\nTELEGRAM_CHAT_ID="777"\nNOTIFY="always"\n' >> "$AAU_CONF"
+: > "$T/tg/sent.jsonl"
 seq 1 60000 | sed 's/^/2026-01-01 00:00:00 старая запись журнала номер /' >> "$AAU_LOG_FILE"
 run_aau run --no-os --no-reboot
 check "run завершился без ошибок" [ $? -eq 0 ]
@@ -354,11 +415,12 @@ check "в журнале итог: обновлять нечего" out_has "===
 check "журнал обрезан до LOG_MAX_MB=1" [ "$(stat -c %s "$AAU_LOG_FILE")" -le $((1024 * 1024)) ]
 check "в конце журнала этот запуск" bash -c 'tail -n 1 "$1" | grep -q "=== итог: ok"' _ "$AAU_LOG_FILE"
 check "журнал начинается с целой строки" bash -c 'head -n 1 "$1" | grep -qE "^2026-01-01 00:00:00 старая запись журнала номер [0-9]+$"' _ "$AAU_LOG_FILE"
+check "отчёт ушёл в Telegram" bash -c 'jq -r .text "$1" | grep -q "^\[.*\] Amnezia autoupdate$"' _ "$T/tg/sent.jsonl"
 # Запуск так же, как его делает таймер: отдельным сервисом systemd (на машинах с systemd, например в CI)
 if [[ -d /run/systemd/system ]] && command -v systemd-run >/dev/null 2>&1; then
   systemd-run --quiet --wait --pipe --collect \
     -E AAU_CONF="$AAU_CONF" -E AAU_STATE_DIR="$AAU_STATE_DIR" -E AAU_BACKUP_DIR="$AAU_BACKUP_DIR" \
-    -E AAU_LOG_FILE="$AAU_LOG_FILE" -E AAU_LOCK_FILE="$AAU_LOCK_FILE" \
+    -E AAU_LOG_FILE="$AAU_LOG_FILE" -E AAU_LOCK_FILE="$AAU_LOCK_FILE" -E AAU_TELEGRAM_API="$AAU_TELEGRAM_API" \
     "$(command -v bash)" "$ROOT/amnezia-autoupdate" run --no-os --no-reboot > "$T/last.out" 2>&1
   rc=$?
   sed 's/^/    | /' "$T/last.out"

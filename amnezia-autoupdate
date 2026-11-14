@@ -18,7 +18,7 @@ set -uo pipefail
 umask 077
 export LC_ALL=C
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 PROG="amnezia-autoupdate"
 
 CONF_FILE="${AAU_CONF:-/etc/amnezia-autoupdate.conf}"
@@ -44,6 +44,8 @@ HEALTH_TIMEOUT="60"          # сколько секунд ждать, пока 
 NOTIFY="changes"             # changes | errors | always | never (уведомления в Telegram)
 TELEGRAM_BOT_TOKEN=""
 TELEGRAM_CHAT_ID=""
+TELEGRAM_COMMANDS="yes"      # отвечать на команды в Telegram (/status), только чату TELEGRAM_CHAT_ID
+TELEGRAM_API="${AAU_TELEGRAM_API:-https://api.telegram.org}"   # адрес Bot API (другой нужен только тестам)
 SERVER_NAME=""               # имя сервера в уведомлениях (по умолчанию hostname)
 SELF_UPDATE_URL="https://raw.githubusercontent.com/iF-22/amnezia-autoupdate/main/amnezia-autoupdate"   # откуда брать новую версию этого скрипта
 
@@ -122,13 +124,44 @@ server_label() {
   if [[ -n $SERVER_NAME ]]; then printf '%s' "$SERVER_NAME"; else hostname -f 2>/dev/null || hostname; fi
 }
 
+# ---------------------------------------------------------------- Telegram
+TG_CODE=""
+TG_ERR=""
+
+# Вызов Bot API: tg_api МЕТОД ФАЙЛ_ОТВЕТА [параметры curl]. Возвращает 0, если Telegram
+# ответил ok, иначе код HTTP в TG_CODE (000 = нет связи) и текст ошибки в TG_ERR.
+# Адрес с токеном curl получает через stdin, чтобы токена не было в списке процессов.
+tg_api() {
+  local method=$1 out=$2 url
+  shift 2
+  url="${TELEGRAM_API%/}/bot${TELEGRAM_BOT_TOKEN}/${method}"
+  url=${url//\\/\\\\}
+  url=${url//\"/\\\"}
+  : > "$out"
+  TG_CODE=$(printf 'url = "%s"\n' "$url" | curl -sS -K - -o "$out" -w '%{http_code}' "$@" 2> "$out.err")
+  [[ $TG_CODE =~ ^[0-9]{3}$ ]] || TG_CODE=000
+  if [[ $TG_CODE == 200 && $(jq -r '.ok' "$out" 2>/dev/null) == true ]]; then
+    TG_ERR=""
+    return 0
+  fi
+  TG_ERR=$(jq -r '[(.error_code // empty | tostring), (.description // empty)] | join(" ")' "$out" 2>/dev/null)
+  [[ -n $TG_ERR ]] || TG_ERR=$(sed -E 's/^curl: \([0-9]+\) //' "$out.err" 2>/dev/null | head -n 1)
+  [[ -n $TG_ERR ]] || TG_ERR="HTTP $TG_CODE"
+  return 1
+}
+
+# Сообщение Telegram не длиннее 4096 символов: обрезаем по целым строкам, с запасом
+tg_trim() { awk -v max=3900 '{ n += length($0) + 1; if (n > max) { print "…"; exit } print }'; }
+
+tg_send() {   # tg_send ЧАТ ТЕКСТ
+  tg_api sendMessage "${WORK:-/tmp}/tg-send.json" --max-time 20 \
+    --data-urlencode "chat_id=$1" --data-urlencode "text=$(printf '%s\n' "$2" | tg_trim)"
+}
+
 notify() {
   [[ -n $TELEGRAM_BOT_TOKEN && -n $TELEGRAM_CHAT_ID ]] || return 0
-  curl -fsS --max-time 20 -o /dev/null \
-    --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-    --data-urlencode "text=$1" \
-    "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-    || printf '%s ВНИМАНИЕ: не удалось отправить уведомление в Telegram\n' "$(ts)"
+  tg_send "$TELEGRAM_CHAT_ID" "$1" \
+    || printf '%s ВНИМАНИЕ: не удалось отправить уведомление в Telegram: %s\n' "$(ts)" "$TG_ERR"
 }
 
 # ---------------------------------------------------------------- общее
@@ -1424,11 +1457,14 @@ MIN_FREE_MB="1500"
 # самые старые записи отрезаются (0 = не ограничивать)
 LOG_MAX_MB="10"
 
-# Уведомления в Telegram (необязательно): токен бота от @BotFather и id чата
+# Уведомления в Telegram (необязательно): токен бота от @BotFather и id чата.
+# После изменения выполни "amnezia-autoupdate install", чтобы перезапустить бота
 TELEGRAM_BOT_TOKEN=""
 TELEGRAM_CHAT_ID=""
 # changes = об изменениях и ошибках, errors = только об ошибках, always, never
 NOTIFY="changes"
+# Отвечать на команду /status в Telegram (только в чат TELEGRAM_CHAT_ID): yes или no
+TELEGRAM_COMMANDS="yes"
 # Имя сервера в уведомлениях (по умолчанию hostname)
 SERVER_NAME=""
 
@@ -1529,6 +1565,81 @@ EOF
   log "расписание: каждый день в $cal, плюс случайная задержка до $delay"
 }
 
+# Служба бота только читает состояние сервера: без новых привилегий, /usr и /etc только
+# для чтения, не больше 128 МБ памяти
+write_bot_unit() {
+  cat > "$UNIT_DIR/$BOT_UNIT" <<EOF
+[Unit]
+Description=Amnezia VPN auto-update: Telegram bot commands (/status)
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=simple
+ExecStart=$BIN_PATH bot
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=15
+Nice=10
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 644 "$UNIT_DIR/$BOT_UNIT"
+}
+
+# Бот для команд: служба нужна, только если задан бот и числовой id чата
+setup_bot() {
+  if bot_enabled; then
+    write_bot_unit
+    systemctl daemon-reload
+    systemctl enable "$BOT_UNIT" >/dev/null 2>&1 || warn "не удалось включить $BOT_UNIT"
+    systemctl restart "$BOT_UNIT" >/dev/null 2>&1 || warn "не удалось запустить $BOT_UNIT"
+    log "бот Telegram: отвечает на /status в чате $TELEGRAM_CHAT_ID (журнал: journalctl -u ${BOT_UNIT%.service})"
+  elif [[ -f $UNIT_DIR/$BOT_UNIT ]]; then
+    systemctl disable --now "$BOT_UNIT" >/dev/null 2>&1
+    rm -f "$UNIT_DIR/$BOT_UNIT"
+    systemctl daemon-reload
+    log "бот Telegram: команды выключены, служба $BOT_UNIT удалена"
+  fi
+  if [[ -n $TELEGRAM_BOT_TOKEN && $TELEGRAM_COMMANDS == yes && -n $TELEGRAM_CHAT_ID ]] \
+     && ! [[ $TELEGRAM_CHAT_ID =~ ^-?[0-9]+$ ]]; then
+    warn "для команд в Telegram нужен числовой ID чата, а не '$TELEGRAM_CHAT_ID'"
+  fi
+}
+
+# Проверка токена и чата: бот пишет в чат, что подключён
+telegram_check() {
+  local name text
+  [[ -n $TELEGRAM_BOT_TOKEN && -n $TELEGRAM_CHAT_ID ]] || return 0
+  if ! tg_api getMe "$WORK/tg-me.json" --max-time 20; then
+    if [[ $TG_CODE == 401 || $TG_CODE == 404 ]]; then
+      warn "Telegram не принимает токен бота ($TG_ERR), проверь --telegram-token"
+    else
+      warn "не удалось связаться с Telegram ($TG_ERR)"
+    fi
+    return 0
+  fi
+  name=$(jq -r '.result.username // empty' "$WORK/tg-me.json" 2>/dev/null)
+  text="[$(server_label)] $PROG $VERSION подключён к этому чату."
+  case $NOTIFY in
+    always) text+=$'\n'"Отчёт придёт после каждого ночного обновления." ;;
+    errors) text+=$'\n'"Отчёты будут приходить только об ошибках." ;;
+    never) text+=$'\n'"Отчёты выключены (NOTIFY=never)." ;;
+    *) text+=$'\n'"Отчёт придёт, когда что-то обновится или случится ошибка. Если обновлять нечего, отчёта не будет." ;;
+  esac
+  bot_enabled && text+=$'\n'"Состояние сервера в любой момент: /status"
+  if tg_send "$TELEGRAM_CHAT_ID" "$text"; then
+    log "Telegram: бот${name:+ @$name} прислал проверочное сообщение в чат $TELEGRAM_CHAT_ID"
+  else
+    warn "Telegram: бот${name:+ @$name} не смог написать в чат $TELEGRAM_CHAT_ID ($TG_ERR). Напиши боту любое сообщение и проверь ID чата"
+  fi
+}
+
 cmd_install() {
   local deploy="" import_file="" update_now=0 journal_max="200M" self target extra=() a
   local -A setv=()
@@ -1542,6 +1653,7 @@ cmd_install() {
       --no-os-update) setv[OS_UPDATE]=no ;;
       --telegram-token) setv[TELEGRAM_BOT_TOKEN]=${2:-}; shift ;;
       --telegram-chat) setv[TELEGRAM_CHAT_ID]=${2:-}; shift ;;
+      --telegram-commands) setv[TELEGRAM_COMMANDS]=${2:-}; shift ;;
       --name) setv[SERVER_NAME]=${2:-}; shift ;;
       --upstream-ref) setv[UPSTREAM_REF]=${2:-}; shift ;;
       --self-update-url) setv[SELF_UPDATE_URL]=${2:-}; shift ;;
@@ -1557,6 +1669,7 @@ cmd_install() {
   need_root
   init_work
   case ${setv[REBOOT]:-if-needed} in if-needed|never|always) ;; *) die "--reboot: if-needed, never или always" ;; esac
+  case ${setv[TELEGRAM_COMMANDS]:-yes} in yes|no) ;; *) die "--telegram-commands: yes или no" ;; esac
   [[ -z $import_file || -f $import_file ]] || die "нет файла $import_file"
   command -v systemctl >/dev/null 2>&1 || die "нужен systemd"
 
@@ -1600,6 +1713,8 @@ cmd_install() {
   if (( LOG_MAX_MB > 0 )); then
     log "журнал: $LOG_FILE, циклический, до $LOG_MAX_MB МБ"
   fi
+  setup_bot
+  telegram_check
   log "установка завершена"
 
   local owner=${SUDO_USER:-}
@@ -1623,14 +1738,15 @@ cmd_uninstall() {
   [[ ${1:-} == --purge ]] && purge=1
   need_root
   systemctl disable --now amnezia-autoupdate.timer amnezia-hostsetup.service >/dev/null 2>&1
+  [[ -f $UNIT_DIR/$BOT_UNIT ]] && systemctl disable --now "$BOT_UNIT" >/dev/null 2>&1
   rm -f "$UNIT_DIR/amnezia-autoupdate.service" "$UNIT_DIR/amnezia-autoupdate.timer" "$UNIT_DIR/amnezia-hostsetup.service" \
-        /etc/systemd/journald.conf.d/60-amnezia-autoupdate.conf /etc/logrotate.d/amnezia-autoupdate
+        "$UNIT_DIR/$BOT_UNIT" /etc/systemd/journald.conf.d/60-amnezia-autoupdate.conf /etc/logrotate.d/amnezia-autoupdate
   systemctl daemon-reload >/dev/null 2>&1
   if (( purge )); then
     rm -rf "$STATE_DIR" "$BACKUP_ROOT" "$CONF_FILE" "$LOG_FILE"
-    echo "удалены таймер, настройки, резервные копии и журнал"
+    echo "удалены таймер, бот Telegram, настройки, резервные копии и журнал"
   else
-    echo "таймер удалён; настройки ($CONF_FILE) и резервные копии ($BACKUP_ROOT) оставлены"
+    echo "таймер и бот Telegram удалены; настройки ($CONF_FILE) и резервные копии ($BACKUP_ROOT) оставлены"
   fi
   rm -f "$BIN_PATH"
   echo "контейнеры Amnezia не тронуты"
@@ -1646,6 +1762,11 @@ cmd_self_update() {
   grep -q '^PROG="amnezia-autoupdate"' "$WORK/new" || die "скачанный файл не похож на $PROG"
   install -m 755 "$WORK/new" "$BIN_PATH"
   echo "обновлён до $(bash "$BIN_PATH" version)"
+  # бот работает на прежней версии скрипта, пока его не перезапустить
+  if [[ -f $UNIT_DIR/$BOT_UNIT ]] && command -v systemctl >/dev/null 2>&1; then
+    systemctl try-restart "$BOT_UNIT" >/dev/null 2>&1
+  fi
+  return 0
 }
 
 # ---------------------------------------------------------------- команды
@@ -1749,39 +1870,409 @@ cmd_check() {
   (( ${#ERRORS[@]} == 0 ))
 }
 
-cmd_status() {
-  local c state line
-  echo "$PROG $VERSION"
-  if command -v systemctl >/dev/null 2>&1; then
-    line=$(systemctl list-timers amnezia-autoupdate.timer --no-pager --no-legend 2>/dev/null | head -1)
-    echo "Следующий запуск: ${line:-таймер не найден}"
+# ---------------------------------------------------------------- состояние сервера
+# Его показывают "status" и команда /status в Telegram
+
+human_secs() {   # 3 дн 2 ч, 5 ч 7 мин, 12 мин
+  local s=$1
+  if (( s >= 86400 )); then printf '%s дн %s ч' $((s / 86400)) $((s % 86400 / 3600))
+  elif (( s >= 3600 )); then printf '%s ч %s мин' $((s / 3600)) $((s % 3600 / 60))
+  elif (( s >= 60 )); then printf '%s мин' $((s / 60))
+  else printf 'меньше минуты'
   fi
-  if [[ -f $STATE_DIR/last-run ]]; then
-    echo "Последний запуск:"
-    sed 's/^/  /' "$STATE_DIR/last-run"
+}
+
+# Время в часовом поясе расписания (UPDATE_TZ), если он есть на сервере
+fmt_time() {   # fmt_time UNIX-ВРЕМЯ -> "2026-11-15 04:12 MSK"
+  local tz=${UPDATE_TZ:-}
+  if [[ -n $tz && -f /usr/share/zoneinfo/$tz ]]; then
+    TZ=$tz date -d "@$1" '+%F %H:%M %Z'
   else
-    echo "Последний запуск: ещё не было"
+    date -d "@$1" '+%F %H:%M %Z'
   fi
-  [[ -f $STATE_DIR/upstream/current/.tag ]] && echo "Скрипты Amnezia: релиз $(cat "$STATE_DIR/upstream/current/.tag")"
-  if have_docker; then
-    echo "Контейнеры:"
-    while IFS= read -r c; do
-      [[ -z $c ]] && continue
-      state="остановлен"
-      c_running "$c" && state="работает"
-      line="  $c: $state, образ от $(docker image inspect -f '{{.Created}}' "$(c_image "$c")" 2>/dev/null | cut -c1-16)"
-      if [[ -f $STATE_DIR/containers/$c.state ]]; then
-        line+=", обновлён $(sed -n 's/^UPDATED_AT=//p' "$STATE_DIR/containers/$c.state" | cut -c1-16)"
-        line+=" (релиз $(sed -n 's/^UPSTREAM_TAG=//p' "$STATE_DIR/containers/$c.state"))"
+}
+fmt_iso() {   # fmt_iso 2026-11-14T09:52:57+03:00 -> то же
+  local t
+  if [[ -n $1 ]] && t=$(date -d "$1" +%s 2>/dev/null); then fmt_time "$t"; else printf '%s' "${1:-?}"; fi
+}
+
+# Когда таймер запустит обновление в следующий раз
+next_run() {
+  local v t="" now re='^[A-Za-z]+ ([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2})'
+  [[ -f $UNIT_DIR/amnezia-autoupdate.timer ]] || { printf 'таймер не установлен'; return 0; }
+  v=$(systemctl show --timestamp=unix -p NextElapseUSecRealtime --value amnezia-autoupdate.timer 2>/dev/null)
+  if [[ $v =~ ^@([0-9]+)$ ]]; then
+    t=${BASH_REMATCH[1]}
+  else
+    # старый systemd без --timestamp: "Sun 2026-11-15 04:12:00 MSK" по часам сервера
+    v=$(systemctl show -p NextElapseUSecRealtime --value amnezia-autoupdate.timer 2>/dev/null)
+    [[ $v =~ $re ]] && t=$(date -d "${BASH_REMATCH[1]}" +%s 2>/dev/null)
+  fi
+  if ! [[ $t =~ ^[0-9]+$ ]] || (( t == 0 )); then
+    printf 'не запланирован (таймер выключен?)'
+    return 0
+  fi
+  now=$(date +%s)
+  printf '%s' "$(fmt_time "$t")"
+  (( t > now )) && printf ' (через %s)' "$(human_secs $((t - now)))"
+  return 0
+}
+
+# Сколько у контейнера клиентов и сколько на связи (рукопожатие за последние 3 минуты)
+c_clients() {
+  local c=$1 tool ifc out n
+  case $c in
+    amnezia-awg2|amnezia-awg|amnezia-wireguard)
+      read -r tool ifc <<< "$(wg_tool "$c")"
+      if ! out=$(timeout 10 docker exec "$c" "$tool" show "$ifc" latest-handshakes 2>/dev/null); then
+        printf 'интерфейс %s не отвечает' "$ifc"
+        return 0
       fi
-      [[ -z ${FOLDER_OF[$c]:-} ]] && line+=", автообновление не поддерживается"
-      echo "$line"
-    done < <(list_amnezia_containers)
+      awk -v now="$(date +%s)" 'NF >= 2 { n++; if ($2 > 0 && now - $2 <= 180) on++ }
+        END { printf "клиентов: %d, на связи: %d", n, on }' <<< "$out"
+      ;;
+    amnezia-xray)
+      n=$(timeout 10 docker exec "$c" cat /opt/amnezia/xray/server.json 2>/dev/null \
+          | jq -r '.inbounds[0].settings.clients | length' 2>/dev/null)
+      [[ $n =~ ^[0-9]+$ ]] && printf 'клиентов: %s' "$n"
+      ;;
+  esac
+  return 0
+}
+
+# Идёт ли сейчас обновление (замок не трогаем, чтобы не помешать ему)
+update_running() {
+  pgrep -f '(^|[ /])amnezia-autoupdate (run|update-containers|update-os|deploy|import|restore)( |$)' >/dev/null 2>&1
+}
+
+status_text() {
+  local c st line vers v f n cs=()
+  printf '[%s] %s %s\n' "$(server_label)" "$PROG" "$VERSION"
+  update_running && printf 'Сейчас идёт обновление\n'
+  if have_docker; then
+    mapfile -t cs < <(list_amnezia_containers)
+    if (( ${#cs[@]} > 0 )); then printf 'Контейнеры:\n'; else printf 'Контейнеров Amnezia нет\n'; fi
+    for c in "${cs[@]}"; do
+      st=$(docker container inspect -f '{{.State.Status}}' "$c" 2>/dev/null)
+      case $st in
+        running) line="работает" ;;
+        restarting) line="падает и перезапускается" ;;
+        exited|created) line="остановлен" ;;
+        paused) line="на паузе" ;;
+        *) line=${st:-нет данных} ;;
+      esac
+      vers=""
+      if [[ $st == running ]]; then
+        v=$(c_clients "$c")
+        [[ -n $v ]] && line+=", $v"
+        vers=$(c_versions "$c")
+      fi
+      printf '  %s: %s\n' "$c" "$line"
+      f=$STATE_DIR/containers/$c.state
+      if [[ -f $f ]]; then
+        case $(sed -n 's/^REASON=//p' "$f") in
+          установка) v="установлен" ;;
+          импорт) v="импортирован" ;;
+          *) v="обновлён" ;;
+        esac
+        v+=" $(fmt_iso "$(sed -n 's/^UPDATED_AT=//p' "$f")") (релиз $(sed -n 's/^UPSTREAM_TAG=//p' "$f"))"
+      else
+        v="образ от $(fmt_iso "$(docker image inspect -f '{{.Created}}' "$(c_image "$c")" 2>/dev/null)")"
+      fi
+      [[ -z ${FOLDER_OF[$c]:-} ]] && v+=", автообновление не поддерживается"
+      printf '    %s\n' "${vers:+$vers; }$v"
+    done
   else
-    echo "Docker не запущен"
+    printf 'Docker не запущен\n'
   fi
-  echo "Свободно на диске: $(free_mb /) МБ"
-  if reboot_required; then echo "Нужна перезагрузка: да ($(reboot_reason))"; else echo "Нужна перезагрузка: нет"; fi
+  f=$STATE_DIR/last-run
+  if [[ -f $f ]]; then
+    v=$(sed -n 's/^RESULT=//p' "$f")
+    [[ $v == errors ]] && v="ошибки"
+    printf 'Последний запуск: %s, итог: %s\n' "$(fmt_iso "$(sed -n 's/^FINISHED_AT=//p' "$f")")" "${v:-?}"
+    # после FINISHED_AT, RESULT и заголовка отчёта идут его строки
+    n=$(tail -n +4 "$f" | wc -l)
+    tail -n +4 "$f" | head -n 30 | sed 's/^/  /'
+    (( n > 30 )) && printf '  … ещё строк: %s\n' $((n - 30))
+  else
+    printf 'Последний запуск: ещё не было\n'
+  fi
+  printf 'Следующий запуск: %s\n' "$(next_run)"
+  [[ -f $STATE_DIR/upstream/current/.tag ]] && printf 'Скрипты Amnezia: релиз %s\n' "$(cat "$STATE_DIR/upstream/current/.tag")"
+  printf 'Свободно на диске: %s МБ\n' "$(free_mb /)"
+  if reboot_required; then printf 'Нужна перезагрузка: да (%s)\n' "$(reboot_reason)"; else printf 'Нужна перезагрузка: нет\n'; fi
+  if read -r v _ < /proc/uptime 2>/dev/null; then printf 'Сервер запущен %s назад\n' "$(human_secs "${v%.*}")"; fi
+  return 0
+}
+
+cmd_status() { status_text; }
+
+# ---------------------------------------------------------------- бот Telegram: команды
+# Служба amnezia-autoupdate-bot спрашивает у Telegram новые сообщения бота и отвечает
+# на /status только в чат TELEGRAM_CHAT_ID. Она только читает состояние сервера.
+#
+# Telegram отдаёт сообщения бота одному получателю. Пока сервер с ботом один, запрос
+# getUpdates висит до 50 секунд и ответ приходит сразу. Если тот же бот стоит на
+# нескольких серверах, их запросы обрывают друг друга (ошибка 409). Тогда каждый сервер
+# раз в BOT_POLL секунд читает последние сообщения, ничего не подтверждая, и на /status
+# отвечает каждый сервер. Раз в BOT_PROBE секунд сервер проверяет, не остался ли он один.
+BOT_UNIT="amnezia-autoupdate-bot.service"
+BOT_TIMEOUT="${AAU_BOT_TIMEOUT:-50}"   # сколько секунд Telegram держит запрос, пока нет сообщений
+BOT_POLL="${AAU_BOT_POLL:-15}"         # общий бот: опрос раз в столько секунд
+BOT_PROBE="${AAU_BOT_PROBE:-21600}"    # общий бот: раз в 6 часов проверять, не остался ли сервер один
+BOT_MAX_AGE="600"                      # после запуска отвечать только на команды не старше 10 минут
+BOT_MODE="single"                      # single: сервер у бота один, shared: бот общий
+BOT_SINCE=0                            # когда бот стал общим
+BOT_LAST_ID=""                         # последний разобранный update_id и когда (чтобы после
+BOT_LAST_AT=""                         # перезапуска не ответить второй раз)
+BOT_MAX_ID=""
+BOT_FIRST=1
+BOT_SELF=""
+BOT_USER=""
+declare -A BOT_SEEN=() BOT_STRANGERS=() BOT_DONE=()
+BOT_SEEN_ORDER=()
+
+# Команды принимаются, если задан бот, числовой id чата и TELEGRAM_COMMANDS=yes
+bot_enabled() { [[ -n $TELEGRAM_BOT_TOKEN && $TELEGRAM_CHAT_ID =~ ^-?[0-9]+$ && $TELEGRAM_COMMANDS == yes ]]; }
+
+# Сколько ждать ответа на общем боте: опрос раз в BOT_POLL ± 20% секунд и сам запрос
+bot_shared_wait() { printf '%s' $((BOT_POLL * 6 / 5 + 2)); }
+
+bot_mode_text() {
+  if [[ $BOT_MODE == shared ]]; then
+    printf 'бот общий с другими серверами, ответ в течение %s с' "$(bot_shared_wait)"
+  else
+    printf 'ответ сразу'
+  fi
+}
+
+bot_save_state() {
+  mkdir -p "$STATE_DIR"
+  printf 'BOT_ID=%s\nMODE=%s\nSINCE=%s\nLAST_ID=%s\nLAST_AT=%s\n' "${TELEGRAM_BOT_TOKEN%%:*}" \
+    "$BOT_MODE" "$BOT_SINCE" "$BOT_LAST_ID" "$BOT_LAST_AT" > "$STATE_DIR/bot.state.tmp" \
+    && mv -f "$STATE_DIR/bot.state.tmp" "$STATE_DIR/bot.state"
+}
+
+bot_load_state() {
+  local f="$STATE_DIR/bot.state" now mode since id at
+  [[ -f $f ]] || return 0
+  [[ $(sed -n 's/^BOT_ID=//p' "$f") == "${TELEGRAM_BOT_TOKEN%%:*}" ]] || return 0   # другой бот
+  now=$(date +%s)
+  mode=$(sed -n 's/^MODE=//p' "$f")
+  since=$(sed -n 's/^SINCE=//p' "$f")
+  id=$(sed -n 's/^LAST_ID=//p' "$f")
+  at=$(sed -n 's/^LAST_AT=//p' "$f")
+  if [[ $mode == shared && $since =~ ^[0-9]+$ ]] && (( now - since < BOT_PROBE )); then
+    BOT_MODE=shared
+    BOT_SINCE=$since
+  fi
+  # через неделю без сообщений Telegram начинает update_id заново со случайного числа
+  if [[ $id =~ ^[0-9]+$ && $at =~ ^[0-9]+$ ]] && (( now - at < 6 * 86400 )); then
+    BOT_LAST_ID=$id
+    BOT_LAST_AT=$at
+  fi
+}
+
+bot_help() {
+  printf '[%s] %s %s\n' "$(server_label)" "$PROG" "$VERSION"
+  printf '/status — состояние сервера: контейнеры и клиенты, последнее и следующее обновление, место на диске\n'
+  if [[ $BOT_MODE == shared ]]; then
+    printf 'Этого бота слушают несколько серверов, на /status ответит каждый в течение %s с. Спросить только этот: /status %s\n' \
+      "$(bot_shared_wait)" "$(server_label)"
+  fi
+}
+
+bot_is_me() {   # /status ИМЯ: это имя этого сервера?
+  local want=${1,,} n
+  for n in "$SERVER_NAME" "$(hostname -s 2>/dev/null)" "$(hostname -f 2>/dev/null)"; do
+    [[ -n $n && ${n,,} == "$want" ]] && return 0
+  done
+  return 1
+}
+
+bot_command() {   # bot_command ТЕКСТ_СООБЩЕНИЯ
+  local cmd arg to reply rc
+  read -r cmd arg _ <<< "$1"
+  [[ $cmd == /* ]] || return 0
+  cmd=${cmd,,}
+  if [[ $cmd == *@* ]]; then          # /status@имя_бота в группах
+    to=${cmd#*@}
+    cmd=${cmd%%@*}
+    [[ -z $BOT_USER || $to == "${BOT_USER,,}" ]] || return 0
+  fi
+  case $cmd in
+    /status)
+      [[ -z $arg ]] || bot_is_me "$arg" || return 0
+      [[ -z ${BOT_DONE[status]:-} ]] || return 0   # несколько /status подряд: отвечаем один раз
+      BOT_DONE[status]=1
+      reply=$(timeout 60 bash "$BOT_SELF" status 2>/dev/null)
+      rc=$?
+      (( rc == 124 )) && reply+=$'\n'"(состояние собрано не полностью: не уложились в 60 с)"
+      [[ -n $reply ]] || reply="[$(server_label)] не удалось узнать состояние сервера"
+      ;;
+    *)
+      [[ -z ${BOT_DONE[help]:-} ]] || return 0
+      BOT_DONE[help]=1
+      reply=$(bot_help)
+      ;;
+  esac
+  if tg_send "$TELEGRAM_CHAT_ID" "$reply"; then
+    log "бот: ответил на $cmd"
+  else
+    log "бот: не смог ответить на $cmd: $TG_ERR"
+  fi
+}
+
+# Разбирает ответ getUpdates и отвечает на новые команды из нашего чата
+bot_process() {   # bot_process ФАЙЛ
+  local id chat date text now new=""
+  now=$(date +%s)
+  BOT_MAX_ID=""
+  BOT_DONE=()
+  while IFS=$'\x1f' read -r id chat date text; do
+    [[ $id =~ ^[0-9]+$ ]] || continue
+    if [[ -z $BOT_MAX_ID ]] || (( id > BOT_MAX_ID )); then BOT_MAX_ID=$id; fi
+    [[ -z ${BOT_SEEN[$id]:-} ]] || continue
+    BOT_SEEN[$id]=1
+    BOT_SEEN_ORDER+=("$id")
+    if [[ -z $new ]] || (( id > new )); then new=$id; fi
+    [[ -n $chat ]] || continue
+    if [[ $chat != "$TELEGRAM_CHAT_ID" ]]; then
+      if [[ -z ${BOT_STRANGERS[$chat]:-} ]]; then
+        BOT_STRANGERS[$chat]=1
+        log "бот: сообщение из чужого чата $chat, не отвечаю"
+      fi
+      continue
+    fi
+    # сразу после запуска: старые команды и те, на которые уже ответили до перезапуска
+    if (( BOT_FIRST )); then
+      [[ $date =~ ^[0-9]+$ ]] && (( now - date > BOT_MAX_AGE )) && continue
+      [[ -n $BOT_LAST_ID ]] && (( id <= BOT_LAST_ID )) && continue
+    fi
+    # запоминаем сообщение до ответа: если службу перезапустят, пока бот отвечает,
+    # Telegram отдаст это сообщение снова, а второго ответа не будет
+    BOT_LAST_ID=$id
+    BOT_LAST_AT=$now
+    bot_save_state
+    bot_command "$text" < /dev/null
+  done < <(jq -r '.result[]? | [(.update_id | tostring), (.message.chat.id // "" | tostring),
+                   (.message.date // 0 | tostring), ((.message.text // "") | gsub("[\u001f\r\n]"; " "))]
+                 | join("\u001f")' "$1" 2>/dev/null)
+  if (( ${#BOT_SEEN_ORDER[@]} > 200 )); then
+    for id in "${BOT_SEEN_ORDER[@]:0:100}"; do unset "BOT_SEEN[$id]"; done
+    BOT_SEEN_ORDER=("${BOT_SEEN_ORDER[@]:100}")
+  fi
+  if [[ -n $new ]]; then
+    BOT_LAST_ID=$new
+    BOT_LAST_AT=$now
+    bot_save_state
+  fi
+  return 0
+}
+
+# sleep в фоне и wait: так остановка службы не ждёт конца паузы
+bot_sleep() { sleep "$1" & wait $!; }
+
+bot_loop() {
+  local args conflict_at=0 err_code="" delay=0 offset="" now hint d
+  while :; do
+    if [[ $BOT_MODE == shared ]]; then
+      args=(-G --max-time 20 --data-urlencode "offset=-5" --data-urlencode "timeout=0")
+    else
+      args=(-G --max-time $((BOT_TIMEOUT + 20)) --data-urlencode "timeout=$BOT_TIMEOUT")
+      [[ -n $offset ]] && args+=(--data-urlencode "offset=$offset")
+    fi
+    args+=(--data-urlencode 'allowed_updates=["message"]')
+    if tg_api getUpdates "$WORK/updates.json" "${args[@]}"; then
+      [[ -n $err_code ]] && log "бот: связь с Telegram снова есть"
+      err_code=""
+      delay=0
+      bot_process "$WORK/updates.json"
+      BOT_FIRST=0
+      # offset подтверждает полученные сообщения. Когда новых нет, запрашиваем без него:
+      # так Telegram отдаст и сообщение с update_id, начатым заново через неделю тишины
+      offset=""
+      [[ $BOT_MODE == single && -n $BOT_MAX_ID ]] && offset=$((BOT_MAX_ID + 1))
+    elif [[ $TG_CODE == 409 && $TG_ERR != *webhook* ]]; then
+      # getUpdates этого бота вызывает кто-то ещё, обычно другой сервер с тем же токеном.
+      # Один такой обрыв бывает и от getUpdates в браузере, общим бот считаем после второго.
+      now=$(date +%s)
+      if [[ $BOT_MODE == shared ]]; then
+        bot_sleep $((1 + RANDOM % 3))
+      elif (( now - conflict_at < 600 )); then
+        BOT_MODE=shared
+        BOT_SINCE=$now
+        bot_save_state
+        log "бот: этого бота слушает ещё один сервер, перехожу на общий режим ($(bot_mode_text))"
+      else
+        conflict_at=$now
+        bot_sleep $((5 + RANDOM % 11))
+      fi
+      continue
+    else
+      hint=""
+      case $TG_CODE in
+        401|404) delay=600; hint=" (Telegram не принимает токен, проверь TELEGRAM_BOT_TOKEN)" ;;
+        409) delay=600; hint=" (у бота включён webhook: его сообщения получает другая программа)" ;;
+        429) delay=$(jq -r '.parameters.retry_after // 30' "$WORK/updates.json" 2>/dev/null)
+             [[ $delay =~ ^[0-9]+$ ]] || delay=30 ;;
+        *) delay=$((delay < 5 ? 5 : delay * 2)); (( delay > 300 )) && delay=300 ;;
+      esac
+      if [[ $TG_CODE != "$err_code" ]]; then
+        if [[ $TG_CODE == 000 ]]; then
+          log "бот: нет связи с Telegram ($TG_ERR), повторяю через $delay с"
+        else
+          log "бот: ошибка Telegram: ${TG_ERR}${hint}, повторяю через $delay с"
+        fi
+        err_code=$TG_CODE
+      fi
+      bot_sleep "$delay"
+      continue
+    fi
+    if [[ $BOT_MODE == shared ]]; then
+      d=$((BOT_POLL * 8 + RANDOM % (BOT_POLL * 4 + 1)))   # BOT_POLL ± 20%, в десятых секунды
+      bot_sleep "$((d / 10)).$((d % 10))"
+      now=$(date +%s)
+      if (( now - BOT_SINCE >= BOT_PROBE )); then
+        BOT_MODE=single
+        BOT_FIRST=1        # без offset придут и неподтверждённые старые сообщения
+        conflict_at=0
+        offset=""
+        bot_save_state
+        log "бот: проверяю, не остался ли этот сервер у бота один"
+      fi
+    fi
+  done
+}
+
+cmd_bot() {
+  need_root
+  if [[ -z $TELEGRAM_BOT_TOKEN || -z $TELEGRAM_CHAT_ID ]]; then
+    log "бот: в $CONF_FILE не заданы TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID, команды не принимаю"
+    return 0
+  fi
+  if [[ $TELEGRAM_COMMANDS != yes ]]; then
+    log "бот: команды выключены (TELEGRAM_COMMANDS=$TELEGRAM_COMMANDS)"
+    return 0
+  fi
+  if ! [[ $TELEGRAM_CHAT_ID =~ ^-?[0-9]+$ ]]; then
+    log "бот: для команд нужен числовой ID чата, а в TELEGRAM_CHAT_ID '$TELEGRAM_CHAT_ID'"
+    return 0
+  fi
+  [[ $BOT_TIMEOUT =~ ^[0-9]+$ ]] || BOT_TIMEOUT=50
+  [[ $BOT_POLL =~ ^[1-9][0-9]*$ ]] || BOT_POLL=15
+  [[ $BOT_PROBE =~ ^[0-9]+$ ]] || BOT_PROBE=21600
+  init_work
+  trap 'exit 0' TERM INT
+  BOT_SELF=$(readlink -f "${BASH_SOURCE[0]}")
+  bot_load_state
+  if tg_api getMe "$WORK/me.json" --max-time 20; then
+    BOT_USER=$(jq -r '.result.username // empty' "$WORK/me.json" 2>/dev/null)
+  fi
+  tg_api setMyCommands "$WORK/commands.json" --max-time 20 \
+    --data-urlencode 'commands=[{"command":"status","description":"Состояние сервера"},{"command":"help","description":"Что умеет бот"}]'
+  log "бот${BOT_USER:+ @$BOT_USER}: жду команды из чата $TELEGRAM_CHAT_ID ($(bot_mode_text))"
+  bot_loop
 }
 
 cmd_update_containers() {
@@ -1897,15 +2388,16 @@ $PROG $VERSION: автообновление ОС и контейнеров Amne
 
 Установка на сервер (один раз, от root или через sudo):
   bash $PROG install [--time 04:00] [--tz Europe/Moscow] [--reboot if-needed|never]
-                     [--telegram-token ТОКЕН --telegram-chat ID] [--name ИМЯ]
-                     [--deploy awg,xray] [--import ФАЙЛ] [--update-now]
+                     [--telegram-token ТОКЕН --telegram-chat ID] [--telegram-commands yes|no]
+                     [--name ИМЯ] [--deploy awg,xray] [--import ФАЙЛ] [--update-now]
 
 Команды:
   run [--no-os] [--no-containers] [--no-reboot] [--force] [--only ИМЯ]
         полный цикл: ОС, контейнеры, настройки хоста, перезагрузка при необходимости
         (так запускается ежедневный таймер)
   check                 показать, что будет обновлено, ничего не меняя
-  status                расписание, последний запуск, контейнеры, место на диске
+  status                контейнеры и клиенты, последний и следующий запуск, место на диске
+                        (то же присылает бот Telegram на /status)
   update-containers [--force] [--only ИМЯ]
                         только контейнеры Amnezia
   update-os             только пакеты ОС (без перезагрузки)
@@ -1917,7 +2409,8 @@ $PROG $VERSION: автообновление ОС и контейнеров Amne
   backups               список резервных копий /opt/amnezia
   restore ИМЯ [ДАТА]    вернуть ключи и клиентов контейнера из резервной копии
   self-update           скачать новую версию скрипта (SELF_UPDATE_URL в настройках)
-  uninstall [--purge]   убрать таймер (контейнеры не трогаются)
+  bot                   отвечать на /status в Telegram (так работает служба amnezia-autoupdate-bot)
+  uninstall [--purge]   убрать таймер и бота (контейнеры не трогаются)
   version               версия
 
 Настройки: $CONF_FILE, журнал: $LOG_FILE (или journalctl -u amnezia-autoupdate)
@@ -1941,6 +2434,7 @@ main() {
     self-update) cmd_self_update "$@" ;;
     import) cmd_import "$@" ;;
     host-setup) cmd_host_setup "$@" ;;
+    bot) cmd_bot "$@" ;;
     backups) cmd_backups "$@" ;;
     restore) cmd_restore "$@" ;;
     version|--version|-v) echo "$PROG $VERSION" ;;

@@ -17,6 +17,15 @@ jobs:
         run: |
           bash -n amnezia-autoupdate
           shellcheck -s bash amnezia-autoupdate tests/*.sh
+          python3 -m py_compile tests/telegram-mock.py
+
+  bot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Бот Telegram (/status) на заглушке Bot API
+        run: sudo bash tests/bot.sh
 
   e2e:
     runs-on: ubuntu-24.04
